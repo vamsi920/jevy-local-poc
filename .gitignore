@@ -1,0 +1,10 @@
+node_modules/
+.env
+data/*.duckdb*
+data/catalog.json
+data/aliases.json
+frontend/dist/
+test-results/
+data/schema-notes.json
+data/chat-history*
+output/

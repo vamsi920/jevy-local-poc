@@ -1,0 +1,45 @@
+{
+  "_comment": "Optional business hints for this database. The agent works without this file: it discovers tables, columns, joins, categorical values and ranges from DuckDB itself. Add synonyms and definitions here instead of code.",
+  "referenceDateSql": "SELECT as_of FROM dataset_info",
+  "tableSynonyms": {
+    "servers": ["server", "host", "hosts", "machine", "machines", "asset", "assets", "inventory", "box", "boxes", "vm", "vms", "node", "nodes"],
+    "vulnerabilities": ["vulnerability", "vuln", "vulns", "cve", "cves", "finding", "findings"],
+    "incidents": ["incident", "outage", "outages", "ticket", "tickets"],
+    "backups": ["backup", "backup run", "backup runs", "backup job", "backup jobs"],
+    "evergreening": ["evergreen", "upgrade", "upgrades", "os upgrade", "lifecycle refresh"],
+    "applications": ["application", "app", "apps", "service", "services"],
+    "estates": ["estate", "business estate"]
+  },
+  "valueSynonyms": {
+    "prod": "Production",
+    "prd": "Production",
+    "live": "Production",
+    "dev": "Development",
+    "stage": "Staging",
+    "usa": "US",
+    "united states": "US",
+    "america": "US",
+    "uk": "GB",
+    "united kingdom": "GB",
+    "britain": "GB",
+    "england": "GB",
+    "germany": "DE",
+    "india": "IN",
+    "japan": "JP",
+    "australia": "AU",
+    "rhel": "Red Hat Enterprise Linux",
+    "redhat": "Red Hat Enterprise Linux",
+    "red hat": "Red Hat Enterprise Linux",
+    "windows": "Windows Server",
+    "suse": "SUSE Linux"
+  },
+  "definitions": [
+    {"terms": ["active", "open", "outstanding", "unresolved"], "text": "Active vulnerabilities have status Open. Count distinct server_id when counting servers across many findings."},
+    {"terms": ["latest", "most recent", "last backup", "recent backup"], "text": "Backups are run history (many per server). Latest per server: row_number() OVER (PARTITION BY server_id ORDER BY started_at DESC, backup_id DESC) = 1."},
+    {"terms": ["priority", "p1", "p2", "severity", "critical"], "text": "Incident priority P1 is highest priority. Severity (Critical/High/Medium/Low) is a separate attribute from priority."},
+    {"terms": ["unsupported", "end of life", "eol", "out of support"], "text": "Unsupported OS means servers.support_status = 'Unsupported'. Percentages use all servers in the requested group as denominator."},
+    {"terms": ["estate", "estates"], "text": "Estate is applications.estate_id joined to estates.estate_id (servers -> applications -> estates), not the server environment."},
+    {"terms": ["recent", "lately"], "text": "Recent means the last 30 days before the reference date unless specified."},
+    {"terms": ["risk", "riskiest", "risky"], "text": "Risk can be measured with open Critical/High vulnerabilities, incidents, or evergreening risk_level; state which measure was used."}
+  ]
+}

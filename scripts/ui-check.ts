@@ -1,0 +1,3 @@
+import {chromium} from '@playwright/test';
+const browser=await chromium.launch({channel:"chrome"});const page=await browser.newPage();
+for(const [name,width,height] of [['desktop',1440,900],['mobile',390,844]] as const){await page.setViewportSize({width,height});await page.goto('http://127.0.0.1:5173');await page.getByRole('button',{name:'Send question'}).waitFor();await page.waitForTimeout(500);const sizes=await page.evaluate(()=>({width:document.documentElement.clientWidth,scroll:document.documentElement.scrollWidth}));if(sizes.scroll>sizes.width)throw new Error(name+' overflow');await page.screenshot({path:`output/playwright/${name}-current.png`,fullPage:true});console.log(name+' no overflow; input ready');}await browser.close();
