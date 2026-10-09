@@ -3,7 +3,7 @@
 // model gets a correct baseline and a strong model gets an independent second opinion. Returns null
 // whenever the question has anything the draft does not fully understand.
 import type {Catalog,Table} from './catalog.js';
-import {norm,isCommonWord,type Grounding,type Mention} from './grounding.js';
+import {norm,isCommonWord,groundSync,type Grounding,type Mention} from './grounding.js';
 import {identifier as q,sqlLiteral} from './db.js';
 import {numericConditions,unexplainedNumbers} from './numeric.js';
 
@@ -22,17 +22,34 @@ export const labelColumn=(t:Table)=>t.columns.find(c=>c.type==='VARCHAR'&&/(^|_)
 
 export function draftSQL(question:string,g:Grounding,catalog:Catalog):{sql:string;explain:string}|null{
  // "upgrade status breakdown" is "breakdown by upgrade status".
- const text=norm(g.normalized).replace(/^(?:(?:show|give|get)\s+(?:me\s+)?(?:the\s+|a\s+)?)?(.+?)\s+(breakdown|distribution|split|mix)$/,'$2 by $1');
+ let text=norm(g.normalized).replace(/^(?:(?:show|give|get)\s+(?:me\s+)?(?:the\s+|a\s+)?)?(.+?)\s+(breakdown|distribution|split|mix)$/,'$2 by $1');
+ // "compare servers in production vs staging" is the comparison itself.
+ if(/\b(vs|versus|and|with|to|against)\b/.test(text))text=text.replace(/^(?:compare|comparing|comparison of)\s+(?:the\s+)?(?:number of\s+|count of\s+)?/,'');
  // "unresolved"/"unpatched": un- + a date column's stem means that date is missing (IS NULL).
  const unNull:{table:string;column:string}[]=[];
  for(const t of g.unknownTerms.filter(w=>/^un/.test(w))){const stem=t.slice(2).replace(/(ed|d)$/,'');
   for(const tb of g.tables.map(n=>catalog.table(n)))for(const c of tb.columns)if(/DATE|TIME/.test(c.type)&&c.name.split('_')[0].startsWith(stem.slice(0,5))&&stem.length>=4&&(c.profile?.nullCount||0)>0)unNull.push({table:tb.name,column:c.name});}
  const unknown=g.unknownTerms.filter(w=>!(/^un/.test(w)&&unNull.length));
  if(unknown.length)return no(31);
+ // "share of servers by environment": the grouped count, plus each group's percentage of the total.
+ const shareRaw=text.match(/^(?:what (?:is |are )?)?(?:the )?(?:share|percentage|percent|proportion|fraction|split)(?:s)? (?:of )?(.+? (?:by|per|across|for each) .+)$/)
+  ||text.match(/^(?:what (?:is |are )?)?(?:the )?(?:share|percentage|percent|proportion|fraction)s? of (.+?) (?:(?:are|is|that are|which are) )?(?:in|for) (?:each|every) (.+)$/);
+ const shareMatch=shareRaw?(shareRaw[2]?[shareRaw[0],`${shareRaw[1]} by ${shareRaw[2]}`]:shareRaw):null;
+ if(shareMatch&&!/\b(average|avg|mean|total|sum|max|min)\b/.test(shareMatch[1])){
+  const inner=draftSQL(shareMatch[1],groundSync(shareMatch[1],catalog),catalog);
+  const countExpr=inner?.sql.match(/count\(\*\) AS (?:"[^"]+"|\w+)/i)?.[0];
+  if(inner&&countExpr&&/GROUP BY/i.test(inner.sql))return {sql:inner.sql.replace(countExpr,`${countExpr}, round(100.0 * count(*) / sum(count(*)) OVER (), 2) AS percentage`),explain:inner.explain+', with each group\'s percentage of the total'};
+  return no(29);
+ }
  const latest=latestPerEntity(text,g,catalog);if(latest!==undefined)return latest;
  const exists=existencePattern(text,g,catalog);if(exists!==undefined)return exists;
  const extreme=dateExtreme(text,g,catalog);if(extreme!==undefined)return extreme;
  const trend=periodTrend(text,g,catalog);if(trend!==undefined)return trend;
+ const record=recordLookup(text,g,catalog);if(record!==undefined)return record;
+ const twoWay=twoWayBreakdown(text,g,catalog);if(twoWay!==undefined)return twoWay;
+ const listing=firstRows(text,g,catalog);if(listing!==undefined)return listing;
+ const ranked=rankedAggregate(text,g,catalog);if(ranked!==undefined)return ranked;
+ const due=dueWithin(text,g,catalog);if(due!==undefined)return due;
  // "in the last/past N days|weeks" on a named date column is the only time window the draft handles.
  // "this month", "last year", "today": calendar periods relative to the dataset reference date.
  const periodMatch=text.match(/\b(this|current|last|previous) (week|month|quarter|year)\b|\b(today|yesterday)\b/);
@@ -44,23 +61,45 @@ export function draftSQL(question:string,g:Grounding,catalog:Catalog):{sql:strin
  // Columns asked about by presence ("have a resolved date") are not time filters.
  for(const m of g.mentions.filter(m=>m.kind==='column'&&new RegExp('\\b(have|has|with|without|missing|no|having)\\s+(?:an?\\s+|the\\s+|any\\s+)?'+norm(m.text)).test(text)))stripped=stripped.replace(norm(m.text),' ');
  if(windowMatch)stripped=stripped.replace(/\b(not|never)\b(?=.*$)/,' ');
- if(/\b(day|days|week|weeks|month|months|year|years|quarter|recent|recently|last|past|since|ago|today|yesterday|date|when|oldest|newest|latest|earliest|first|never|without|not|no|none|except|excluding|list|show me the|which servers|random|percent|percentage|share|ratio|fraction|both|and also|or)\b/.test(stripped))return no(47);
+ // Field names that contain time words ("retention days", "rto minutes") are fields, not time windows.
+ for(const m of g.mentions.filter(m=>m.kind==='column'&&m.confidence>=0.9&&/\b(day|days|week|weeks|month|months|year|years)\b/.test(norm(m.text))&&!/DATE|TIME/.test(catalog.table(m.table).columns.find(c=>c.name===m.column)?.type||'')))stripped=stripped.replace(norm(m.text),' ');
+ if(/\b(day|days|week|weeks|month|months|year|years|quarter|recent|recently|last|past|since|ago|today|yesterday|date|when|oldest|newest|latest|earliest|first|never|without|not|no|none|except|excluding|list|show me the|which servers|random|percent|percentage|share|ratio|fraction|both|and also)\b/.test(stripped))return no(47);
  // Any uncertain interpretation (inflected or partial matches) means the model decides, not the draft.
  if(g.mentions.some(m=>m.kind==='value'&&(m.via==='partial'||m.confidence<0.9)))return no(49);
  // Position of a mention; multi-word column phrases may be split ("backups by type" ~ backup type).
  const pos=(m:Mention)=>{const i=text.indexOf(norm(m.text));if(i>=0)return i;const last=norm(m.text).split(' ').at(-1)!;return text.search(new RegExp('\\b'+last+'\\b'));};
  const tableMentions=g.mentions.filter(m=>m.kind==='table').sort((a,b)=>pos(a)-pos(b));
+ // "average downtime by environment": no table is named, but the measured numeric field identifies it.
+ if(!tableMentions.length&&(text.match(/\b(average|avg|mean|total|sum of|maximum|max|minimum|min|median)\b/g)||[]).length===1){
+  const measures=g.mentions.filter(m=>m.kind==='column'&&m.confidence>=0.6&&NUMERIC.test(catalog.table(m.table).columns.find(c=>c.name===m.column)?.type||''));
+  if(measures.length===1)tableMentions.push({kind:'table',table:measures[0].table,text:measures[0].text,confidence:1,via:'exact'});
+ }
+ // "how many are blocked": no table named, but every stated value belongs to one table, so that table is the subject.
+ if(!tableMentions.length&&/\b(how many|number of|count)\b/.test(text)){
+  const values=g.mentions.filter(m=>m.kind==='value'&&m.confidence>=0.9&&m.via!=='partial');
+  const owners=[...new Set(values.map(m=>m.table))];
+  if(values.length&&owners.length===1)tableMentions.push({kind:'table',table:owners[0],text:values[0].text,confidence:0.9,via:'exact'});
+ }
+ // "restore test results breakdown" ("breakdown by restore test results"): the grouping field names its table.
+ if(!tableMentions.length&&/\b(by|per|breakdown)\b/.test(text)){
+  const fields=g.mentions.filter(m=>m.kind==='column'&&m.confidence>=0.8);
+  const owners=[...new Set(fields.map(m=>m.table))];
+  if(fields.length&&owners.length===1&&!g.mentions.some(m=>m.kind==='value'&&m.table!==owners[0]))tableMentions.push({kind:'table',table:owners[0],text:owners[0],confidence:0.9,via:'exact'});
+ }
  if(!tableMentions.length)return no(53);
 
  // 1. Measure
  // "top 3 applications by incident count" ranks applications by how many incidents they have.
- const rankBy=!/\b(average|avg|mean|total|sum|max|min)\b/.test(text)?text.match(/\btop \w+ \w+(?: \w+)? by (?:the )?(?:number of |count of |total )?(\w+)(?: count| counts| number| volume)?\b/):null;
- const rankTable=rankBy?tableMentions.find(m=>norm(m.text).split(' ')[0].replace(/s$/,'')===rankBy[1].replace(/s$/,'')):undefined;
+ const rankBy=!/\b(average|avg|mean|total|sum|max|min)\b/.test(text)?text.match(/\b(?:top|bottom) \w+ \w+(?: \w+)? by (?:the )?(?:number of |count of |total )?((?:\w+ ){0,2}?\w+)(?: count| counts| number| volume)?(?= (?:in|for|during|over|with|where|on|at|from|since|last|this)\b|$)/):null;
+ // "by number of open incidents": the ranked table is the last word; earlier words are qualifiers (filters).
+ const rankTable=rankBy?tableMentions.find(m=>norm(m.text).split(' ')[0].replace(/s$/,'')===rankBy[1].split(' ').at(-1)!.replace(/s$/,'')):undefined;
  let superlative=text.match(/(?<!\bat )\b(most|fewest|least|highest number of|lowest number of)\b/);
+ // "bottom 2 countries by server count" ranks ascending.
+ const bottom=/\bbottom \w+ \w+/.test(text)&&!superlative;
  // "top 3 datacenters by incident count": the label may be a column of the counted table.
  const rankColumn=rankTable&&tableMentions[0]===rankTable?g.mentions.find(m=>m.kind==='column'&&m.confidence>=0.9&&!/_id$/.test(m.column!)&&pos(m)<text.indexOf(' by ')&&catalog.table(m.table).columns.find(c=>c.name===m.column)?.type==='VARCHAR'):undefined;
- if(!superlative&&rankTable&&(tableMentions[0]!==rankTable||rankColumn))superlative=Object.assign(['most','most'],{index:text.indexOf(rankBy![0])}) as unknown as RegExpMatchArray;
- const topN=text.match(/\btop (\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b|\b(?:which|what|the|show|list|give me|find) (\d+|two|three|four|five|six|seven|eight|nine|ten)\b(?! (?:day|days|week|weeks|month|months|year|years)\b)/);
+ if(!superlative&&rankTable&&(tableMentions[0]!==rankTable||rankColumn))superlative=Object.assign(bottom?['fewest','fewest']:['most','most'],{index:text.indexOf(rankBy![0])}) as unknown as RegExpMatchArray;
+ const topN=text.match(/\b(?:top|bottom) (\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b|\b(?:which|what|the|show|list|give me|find) (\d+|two|three|four|five|six|seven|eight|nine|ten)\b(?! (?:day|days|week|weeks|month|months|year|years)\b)/);
  const n=topN?Number(topN[1]||topN[2])||NUMBER_WORDS.indexOf(topN[1]||topN[2])+1:1;
  const aggWord=text.match(/\b(average|avg|mean|total|sum of|maximum|max|minimum|min|largest|biggest|highest|longest|smallest|lowest|shortest)\b(?! number)/)?.[1];
  const agg=!aggWord?'count':/average|avg|mean/.test(aggWord)?'avg':/total|sum/.test(aggWord)?'sum':/max|largest|biggest|highest|longest/.test(aggWord)?'max':'min';
@@ -72,28 +111,35 @@ export function draftSQL(question:string,g:Grounding,catalog:Catalog):{sql:strin
  const nounPhrase=!/\b(what|which|who|list|show|display|give|get|find|tell)\b/.test(text)&&(lead===''||lead.split(' ').every(w=>explainedWords.has(w)||['the','our','my','all','any'].includes(w)));
  // "SLA breaches in the Americas estate": a leading yes/no flag is the thing being counted.
  const flagLead=g.mentions.find(m=>m.kind==='column'&&m.confidence>=0.9&&pos(m)>=0&&pos(m)<=text.split(' ').slice(0,2).join(' ').length&&catalog.table(m.table).columns.find(c=>c.name===m.column)?.type==='BOOLEAN'&&!/\b(what|which|who|list|show)\b/.test(text));
- const counting=agg==='count'&&(Boolean(flagLead)||/\b(how many|number of|count|counts|tally)\b/.test(text)||superlative||/\b(per|by|each|every|breakdown|break down)\b/.test(text)||nounPhrase);
- if(agg==='count'&&!counting)return no(74);
+ const counting=agg==='count'&&(Boolean(flagLead)||(/\b(more|fewer|less)\b/.test(text)&&/\b(or|than|versus|vs)\b/.test(text))||/\b(how many|number of|count|counts|tally)\b/.test(text)||superlative||/\b(per|by|each|every|breakdown|break down)\b/.test(text)||nounPhrase);
+ if(agg==='count'&&!counting)return no(76);
  // Numeric conditions ("more than 100 cpu cores"); every number in the question must be explained.
  const nums=numericConditions(g,catalog);
- if(unexplainedNumbers(g,nums.map(x=>x.text)).length)return no(77);
+ if(unexplainedNumbers(g,nums.map(x=>x.text)).length)return no(79);
  const condCols=new Set(nums.map(x=>x.table+'.'+x.column));
  // "how many different CVEs": a distinct count of the named column.
  const distinctWord=text.match(/\b(different|distinct|unique)\s+/);
  // "different CVEs": the word after distinct may also be a table synonym; a same-named column wins.
  const afterDistinct=distinctWord?text.slice(text.indexOf(distinctWord[0])+distinctWord[0].length).split(' ')[0].replace(/s$/,''):'';
  const namedCol=afterDistinct?g.tables.map(t=>catalog.table(t)).flatMap(t=>t.columns.filter(c=>c.name===afterDistinct).map(c=>({kind:'column' as const,table:t.name,column:c.name,text:afterDistinct,confidence:1,via:'exact' as const}))).at(0):undefined;
- const distinctCol=namedCol||(distinctWord?g.mentions.filter(m=>m.kind==='column'&&m.confidence>=0.6&&pos(m)>=text.indexOf(distinctWord[0])&&pos(m)<=text.indexOf(distinctWord[0])+distinctWord[0].length+2).sort((a,b)=>b.confidence-a.confidence)[0]:undefined);
- if(distinctWord&&!distinctCol)return no(85);
+ // "distinct servers had incidents": distinct parent keys seen in the other (child) table named.
+ const entity=afterDistinct&&!namedCol?tableMentions.find(m=>norm(m.text).split(' ')[0].replace(/s$/,'')===afterDistinct):undefined;
+ const entityTable=entity?catalog.table(entity.table):undefined;
+ const childOf=entityTable?.primaryKey?[...new Set(tableMentions.map(m=>m.table))].filter(t=>t!==entityTable.name).map(t=>catalog.table(t)).filter(t=>t.relationships.includes(`${t.name}.${entityTable.primaryKey} = ${entityTable.name}.${entityTable.primaryKey}`)):[];
+ const entityKey=childOf.length===1?{kind:'column' as const,table:childOf[0].name,column:entityTable!.primaryKey!,text:afterDistinct,confidence:1,via:'exact' as const}:undefined;
+ const distinctCol=namedCol||entityKey||(distinctWord?g.mentions.filter(m=>m.kind==='column'&&m.confidence>=0.6&&pos(m)>=text.indexOf(distinctWord[0])&&pos(m)<=text.indexOf(distinctWord[0])+distinctWord[0].length+2).sort((a,b)=>b.confidence-a.confidence)[0]:undefined);
+ if(distinctWord&&!distinctCol)return no(87);
  // Numeric measure: prefer a column of a table the user named ("disk size of any server" -> servers.disk_gb).
  const named=new Set(tableMentions.map(m=>m.table));
  const numericMention=g.mentions.filter(m=>m.kind==='column'&&m.confidence>=0.6&&!condCols.has(m.table+'.'+m.column)&&NUMERIC.test(catalog.table(m.table).columns.find(c=>c.name===m.column)?.type||'')).sort((a,b)=>Number(named.has(b.table))-Number(named.has(a.table))||b.confidence-a.confidence)[0];
- if(agg!=='count'&&!numericMention)return no(89);
- if(agg==='sum'&&/\btotal (number|count)\b/.test(text))return no(90);
+ if(agg!=='count'&&!numericMention)return no(91);
+ if(agg==='sum'&&/\btotal (number|count)\b/.test(text))return no(92);
 
  // 2. Measured table and label (grouping)
  const trigger=Math.max(text.search(/\b(how many|number of|count|most|fewest|least|average|avg|mean|total|sum of|maximum|max|minimum|min)\b/),0);
- let measured=(agg!=='count'?catalog.table(numericMention!.table):undefined)||(flagLead?catalog.table(flagLead.table):undefined)||catalog.table((tableMentions.find(m=>pos(m)>=trigger)||tableMentions[0]).table);
+ // "incident count by ...": the table word right before "count" is what is counted.
+ const countedBefore=/\bcounts?\b/.test(text.slice(trigger,trigger+6))?tableMentions.find(m=>pos(m)>=0&&pos(m)+norm(m.text).length+1===trigger):undefined;
+ let measured=(agg!=='count'?catalog.table(numericMention!.table):undefined)||(flagLead?catalog.table(flagLead.table):undefined)||catalog.table((countedBefore||tableMentions.find(m=>pos(m)>=trigger)||tableMentions[0]).table);
  let label:{table:Table;column:string}|undefined;
  let byMatch=rankTable?null:text.match(/\b(?:by|per|each|every|for each|across)\s+(?:the\s+)?([a-z0-9 ]+)/);
  // "average memory per server": per-row normalisation of the measured table, not a grouping.
@@ -116,7 +162,7 @@ export function draftSQL(question:string,g:Grounding,catalog:Catalog):{sql:strin
   else
   if(col&&(!tab||pos(col)<=pos(tab)||(col.table===tab.table&&!/_id$/.test(col.column!)))){const t=catalog.table(col.table);const c=t.columns.find(x=>x.name===col.column)!;if(c.name===t.primaryKey||/_id$/.test(c.name)){const owner=catalog.tables.find(x=>x.primaryKey===c.name);if(owner)label={table:owner,column:labelColumn(owner)!};}else label={table:t,column:c.name};}
   else if(tab&&tab.table!==measured.name){const t=catalog.table(tab.table);label={table:t,column:labelColumn(t)!};}
-  if(!label)return no(117);
+  if(!label)return no(119);
  }else if(rankTable&&superlative){
   if(rankColumn){label={table:catalog.table(rankColumn.table),column:rankColumn.column!};measured=catalog.table(rankTable.table);}
   else{const t=catalog.table(tableMentions[0].table);label={table:t,column:labelColumn(t)!};measured=catalog.table(rankTable.table);}
@@ -126,11 +172,11 @@ export function draftSQL(question:string,g:Grounding,catalog:Catalog):{sql:strin
   const col=g.mentions.filter(m=>m.kind==='column'&&m.confidence>=0.6&&pos(m)>=0&&pos(m)<head.length&&catalog.table(m.table).columns.find(c=>c.name===m.column)?.type==='VARCHAR'&&!/_id$/.test(m.column!)).sort((a,b)=>b.confidence-a.confidence)[0];
   if(tab){const t=catalog.table(tab.table);label={table:t,column:labelColumn(t)!};}
   else if(col)label={table:catalog.table(col.table),column:col.column!};
-  else return no(126);
+  else return no(129);
   // "which applications have the most vulnerabilities": the measured table follows the superlative.
   const after=tableMentions.find(m=>pos(m)>text.indexOf(superlative[0]));if(after)measured=catalog.table(after.table);
  }
- if(label&&!label.column)return no(130);
+ if(label&&!label.column)return no(133);
 
  // 3. Filters: one column per user phrase, preferring tables already on the path.
  const pathSeed=[measured.name,...(label?[label.table.name]:[])];
@@ -140,19 +186,35 @@ export function draftSQL(question:string,g:Grounding,catalog:Catalog):{sql:strin
  for(const [,list] of byText){
   const onPath=list.filter(m=>pathSeed.includes(m.table));
   const pick=(onPath.length?onPath:list).sort((a,b)=>b.confidence-a.confidence||a.column!.length-b.column!.length);
-  if(onPath.length>1&&new Set(onPath.map(m=>m.column)).size>1&&pick[0].confidence===pick[1].confidence&&pick[0].column!.length===pick[1].column!.length)return no(140);
+  if(onPath.length>1&&new Set(onPath.map(m=>m.column)).size>1&&pick[0].confidence===pick[1].confidence&&pick[0].column!.length===pick[1].column!.length)return no(143);
   filters.push(pick[0]);
  }
- const booleans=g.mentions.filter(m=>m.kind==='column'&&m.confidence>=0.9&&catalog.table(m.table).columns.find(c=>c.name===m.column)?.type==='BOOLEAN');
+ // Comparisons ("production versus test servers", "P1 compared to P4"): two values of one column become a
+ // grouping on that column restricted to the compared values — one query, both answers side by side.
+ const inFilters:{table:string;column:string;values:string[]}[]=[];
+ if(/\b(versus|vs|compared to|compare|comparison|or|and|against|difference)\b/.test(text)){
+  const byCol=new Map<string,Mention[]>();for(const f of filters){const k=f.table+'.'+f.column;byCol.set(k,[...(byCol.get(k)||[]),f]);}
+  for(const [,fs] of byCol){
+   const vals=[...new Set(fs.filter(f=>!f.negated).map(f=>String(f.value)))];if(vals.length<2)continue;
+   if(label&&!(label.table.name===fs[0].table&&label.column===fs[0].column))return no(153);
+   label={table:catalog.table(fs[0].table),column:fs[0].column!};
+   inFilters.push({table:fs[0].table,column:fs[0].column!,values:vals});
+   for(const f of fs)filters.splice(filters.indexOf(f),1);
+  }
+ }
+ // "X or Y" is only understood as a comparison of two values of one column.
+ if(/\b(or|either)\b/.test(text)&&!inFilters.length)return no(160);
+ // A yes/no field that is the grouping ("servers by virtualized") is a label, not a filter.
+ const booleans=g.mentions.filter(m=>m.kind==='column'&&m.confidence>=0.9&&catalog.table(m.table).columns.find(c=>c.name===m.column)?.type==='BOOLEAN'&&!(label&&label.table.name===m.table&&label.column===m.column));
  // Every strong column mention must be used; otherwise the question asks for something else.
  const presenceWords=new Set(g.mentions.filter(m=>m.kind==='column'&&new RegExp('\\b(have|has|with|without|missing|no|having)\\s+(?:an?\\s+|the\\s+|any\\s+)?'+norm(m.text).split(' ')[0]).test(text)).map(m=>m.table+'.'+m.column));
  const used=new Set([...presenceWords,...condCols,...(distinctCol?[distinctCol.table+'.'+distinctCol.column]:[]),...(numericMention?[numericMention.table+'.'+numericMention.column]:[]),...(label?[label.table.name+'.'+label.column]:[]),...booleans.map(m=>m.table+'.'+m.column)]);
- for(const m of g.mentions.filter(m=>m.kind==='column'&&m.confidence>=1&&g.tables.includes(m.table)&&!g.mentions.some(o=>o!==m&&o.kind==='column'&&o.text===m.text&&o.table!==m.table)))if(!used.has(m.table+'.'+m.column)&&!filters.some(f=>f.table===m.table&&f.column===m.column)&&!/_id$/.test(m.column!)&&!tableMentions.some(t=>t.text===m.text))return no(147);
- for(const t of tableMentions)if(![measured.name,label?.table.name,...filters.map(f=>f.table),...booleans.map(b=>b.table),...nums.map(x=>x.table)].includes(t.table))return no(148);
+ for(const m of g.mentions.filter(m=>m.kind==='column'&&m.confidence>=1&&g.tables.includes(m.table)&&!g.mentions.some(o=>o!==m&&o.kind==='column'&&o.text===m.text&&o.table!==m.table)))if(!used.has(m.table+'.'+m.column)&&!filters.some(f=>f.table===m.table&&f.column===m.column)&&!/_id$/.test(m.column!)&&!tableMentions.some(t=>t.text===m.text))return no(165);
+ for(const t of tableMentions)if(![measured.name,label?.table.name,...inFilters.map(f=>f.table),...filters.map(f=>f.table),...booleans.map(b=>b.table),...nums.map(x=>x.table),...(distinctCol?[distinctCol.table]:[])].includes(t.table))return no(166);
 
  let timeFilter='';
  // 4. Join path
- const names=catalog.connect([measured.name,...(label?[label.table.name]:[]),...filters.map(f=>f.table),...booleans.map(b=>b.table),...nums.map(x=>x.table),...(distinctCol?[distinctCol.table]:[])]);
+ const names=catalog.connect([measured.name,...(label?[label.table.name]:[]),...inFilters.map(f=>f.table),...filters.map(f=>f.table),...booleans.map(b=>b.table),...nums.map(x=>x.table),...(distinctCol?[distinctCol.table]:[])]);
  const edges=catalog.tables.flatMap(t=>t.relationships).map(r=>r.split(' = ').map(x=>x.split('.')));
  const joined=[measured.name];const clauses:string[]=[];let fanout=false;
  for(let guard=0;joined.length<names.length&&guard<20;guard++)for(const t of names){
@@ -161,7 +223,7 @@ export function draftSQL(question:string,g:Grounding,catalog:Catalog):{sql:strin
   const [[a,key],[b]]=link;const other=a===t?b:a;
   clauses.push(`JOIN ${q(t)} ON ${q(other)}.${q(key)} = ${q(t)}.${q(key)}`);joined.push(t);
  }
- if(joined.length<names.length)return no(161);
+ if(joined.length<names.length)return no(179);
 // Joining a child table (many rows per measured row) multiplies counts.
  if(names.some(t=>t!==measured.name&&catalog.table(t).relationships.some(r=>r.startsWith(t+'.')&&r.endsWith(' = '+measured.name+'.'+measured.primaryKey))))fanout=true;
 
@@ -190,7 +252,7 @@ export function draftSQL(question:string,g:Grounding,catalog:Catalog):{sql:strin
   const tableWords=new Set(g.mentions.filter(m=>m.kind==='table').flatMap(m=>norm(m.text).split(' ').map(w=>w.replace(/s$/,''))));
   const named=dateCols.find(c=>c.name.split('_').filter(w=>!/^(last|past|date|at|time)$/.test(w)&&!tableWords.has(w)).some(w=>w.length>=4&&qWords.some(x=>x.startsWith(w))));
   const dateName=named?.name||eventDateColumn(measured);
-  if(!dateName||!catalog.referenceDate)return no(190);
+  if(!dateName||!catalog.referenceDate)return no(208);
   const k=Number(windowMatch[1])||({seven:7,thirty:30,ninety:90,fourteen:14} as Record<string,number>)[windowMatch[1]];
   // "not patched in the last 90 days" inverts the window.
   const negatedWindow=/\b(not|never|haven't|hasn't|wasn't|weren't|no)\b/.test(text.slice(0,text.indexOf(windowMatch[0])));
@@ -207,13 +269,13 @@ export function draftSQL(question:string,g:Grounding,catalog:Catalog):{sql:strin
   const last=norm(m.text).split(' ').at(-1)!;const i=typed.findIndex(w=>w.toLowerCase()===last||w.toLowerCase()===last+'s');const next=typed[i+1];
   if(i>=0&&next&&/\d/.test(next)&&!col.values.includes(next)&&!g.mentions.some(x=>x.kind==='value'&&x.text.toLowerCase()===next.toLowerCase()))literalFilters.push(`${q(m.table)}.${q(m.column!)} = ${sqlLiteral(next.toUpperCase()===next||/\d/.test(next)?next.toUpperCase():next)}`);
  }
- const where=[...literalFilters,...unNull.filter(u=>u.table===measured.name).map(u=>`${q(u.table)}.${q(u.column)} IS NULL`),...(timeFilter?[timeFilter]:[]),...nums.map(x=>`${q(x.table)}.${q(x.column)} ${x.op} ${x.value}`),...filters.map(f=>`${q(f.table)}.${q(f.column!)} ${f.negated?'<>':'='} ${sqlLiteral(f.value)}`),...booleans.map(b=>`${b.negated?'NOT ':''}${q(b.table)}.${q(b.column!)}`),
+ const where=[...inFilters.map(f=>`${q(f.table)}.${q(f.column)} IN (${f.values.map(sqlLiteral).join(', ')})`),...literalFilters,...unNull.filter(u=>u.table===measured.name).map(u=>`${q(u.table)}.${q(u.column)} IS NULL`),...(timeFilter?[timeFilter]:[]),...nums.map(x=>`${q(x.table)}.${q(x.column)} ${x.op} ${x.value}`),...filters.map(f=>`${q(f.table)}.${q(f.column!)} ${f.negated?'<>':'='} ${sqlLiteral(f.value)}`),...booleans.map(b=>`${b.negated?'NOT ':''}${q(b.table)}.${q(b.column!)}`),
   ...presence.map(p=>`${q(p.table)}.${q(p.column!)} IS ${new RegExp('\\b(without|missing|no|lack|lacking)\\s+(?:an?\\s+|the\\s+|any\\s+)?'+norm(p.text).split(' ')[0]).test(text)||p.negated?'':'NOT '}NULL`)];
  const labelSql=label?`${q(label.table.name)}.${q(label.column)}`:'';
  const order=superlative?`ORDER BY ${alias} ${/fewest|least|lowest/.test(superlative[0])?'ASC':'DESC'}, ${labelSql} LIMIT ${n}`:label?`ORDER BY ${alias} DESC, ${labelSql}`:'';
  const sql=`SELECT ${label?labelSql+', ':''}${measureSql} AS ${q(alias)} FROM ${q(measured.name)} ${clauses.join(' ')}${where.length?' WHERE '+where.join(' AND '):''}${label?' GROUP BY '+labelSql:''} ${order}`.replace(/\s+/g,' ').trim();
  const explain=`${agg} of ${measured.name}${label?` by ${label.table.name}.${label.column}`:''}${where.length?' where '+where.join(' and '):''}`;
- if(filters.some(f=>isCommonWord(f.text)&&f.confidence<1))return no(213);
+ if(filters.some(f=>isCommonWord(f.text)&&f.confidence<1))return no(231);
  return {sql,explain};
 }
 
@@ -231,9 +293,9 @@ function latestPerEntity(text:string,g:Grounding,catalog:Catalog):{sql:string;ex
  const childMention=g.mentions.find(x=>x.kind==='table'&&x.table===child.name)!;
  const at=text.indexOf(m[0]);const childPos=text.indexOf(norm(childMention.text),at);
  if(childPos<0||childPos-at>m[0].length+12)return undefined;
- const date=eventDateColumn(child);if(!date||!child.primaryKey)return no(231);
+ const date=eventDateColumn(child);if(!date||!child.primaryKey)return no(249);
  const values=g.mentions.filter(x=>x.kind==='value'&&x.confidence>=0.85);
- if(values.some(v=>v.table!==child.name))return no(233);
+ if(values.some(v=>v.table!==child.name))return no(251);
  const booleans=g.mentions.filter(x=>x.kind==='column'&&x.confidence>=0.9&&x.table===child.name&&child.columns.find(c=>c.name===x.column)?.type==='BOOLEAN');
  const cond=[...values.map(v=>`${q(v.column!)} = ${sqlLiteral(v.value)}`),...booleans.map(b=>q(b.column!))];
  const key=q(parent.primaryKey!);
@@ -299,7 +361,10 @@ function dateExtreme(text:string,g:Grounding,catalog:Catalog):{sql:string;explai
 }
 // "incidents per month for the last 3 months", "monthly vulnerability trend".
 function periodTrend(text:string,g:Grounding,catalog:Catalog):{sql:string;explain:string}|null|undefined{
- const m=text.match(/\b(?:per|by|each|every) (day|week|month|quarter|year)\b|\b(daily|weekly|monthly|quarterly|yearly) (?:trend|count|counts|breakdown)\b/);if(!m)return undefined;
+ // "monthly vulnerabilities" too, unless the word is a stored value ("monthly patch schedule").
+ const adverb=text.match(/\b(daily|weekly|monthly|quarterly|yearly)\b/);
+ const adverbIsValue=adverb&&g.mentions.some(x=>x.kind==='value'&&norm(x.text).split(' ').includes(adverb[1]));
+ const m=text.match(/\b(?:per|by|each|every) (day|week|month|quarter|year)\b|\b(daily|weekly|monthly|quarterly|yearly) (?:trend|count|counts|breakdown)\b/)||(adverb&&!adverbIsValue&&g.mentions.some(x=>x.kind==='table')?Object.assign([adverb[0],undefined,adverb[1]],{index:adverb.index}) as RegExpMatchArray:null);if(!m)return undefined;
  const unit=m[1]||{daily:'day',weekly:'week',monthly:'month',quarterly:'quarter',yearly:'year'}[m[2] as 'daily'];
  const tables=[...new Set(g.mentions.filter(x=>x.kind==='table').map(x=>x.table))];if(tables.length!==1)return null;
  const t=catalog.table(tables[0]);const date=eventDateColumn(t);if(!date||!catalog.referenceDate||g.unknownTerms.length)return null;
@@ -307,7 +372,129 @@ function periodTrend(text:string,g:Grounding,catalog:Catalog):{sql:string;explai
  const last=text.match(/\b(?:last|past) (\d+|two|three|four|five|six|twelve) (day|days|week|weeks|month|months|quarter|quarters|year|years)\b/);
  const words:Record<string,number>={two:2,three:3,four:4,five:5,six:6,twelve:12};
  const where=[...vals.map(v=>`${q(v.column!)} = ${sqlLiteral(v.value)}`)];
+ // Yes/no flags named in the question ("major incidents per month") filter the counted rows.
+ const fieldMentions=g.mentions.filter(x=>x.kind==='column'&&x.confidence>=0.6&&x.table===t.name&&x.column!==date&&!/_id$/.test(x.column!));
+ // "incidents per month by priority": one category splits the trend into one series per value.
+ let split:string|undefined;
+ for(const f of fieldMentions){
+  const type=t.columns.find(c=>c.name===f.column)?.type||'';
+  if(type!=='BOOLEAN'){
+   const asSplit=f.confidence>=0.9&&type==='VARCHAR'&&new RegExp('\\b(?:by|per|split by|broken down by|for each)\\s+(?:the\\s+)?'+norm(f.text)+'\\b').test(text)&&!vals.some(v=>v.column===f.column);
+   if(asSplit&&!split){split=f.column!;continue;}
+   if(f.confidence>=0.9)return null;continue;
+  }
+  where.push(f.negated?`NOT ${q(f.column!)}`:q(f.column!));
+ }
  if(last){const k=Number(last[1])||words[last[1]];const u=last[2].replace(/s$/,'');where.push(`${q(date)} >= date_trunc('${u}', DATE '${catalog.referenceDate}') - INTERVAL ${k-1} ${u.toUpperCase()}`);}
- const sql=`SELECT date_trunc('${unit}', ${q(date)})::DATE AS ${q(unit+'_start')}, count(*) AS ${q(t.name+'_count')} FROM ${q(t.name)}${where.length?' WHERE '+where.join(' AND '):''} GROUP BY 1 ORDER BY 1`;
- return {sql,explain:`${t.name} per ${unit}`};
+ const sql=`SELECT date_trunc('${unit}', ${q(date)})::DATE AS ${q(unit+'_start')}, ${split?q(split)+', ':''}count(*) AS ${q(t.name+'_count')} FROM ${q(t.name)}${where.length?' WHERE '+where.join(' AND '):''} GROUP BY ${split?'1, 2':'1'} ORDER BY ${split?'1, 2':'1'}`;
+ return {sql,explain:`${t.name} per ${unit}${split?' by '+split:''}`};
+}
+
+// "What OS does host-00042 run and which application is it on?": attributes of one identified record,
+// plus the label of each parent record it references. Child tables (many rows) are left to the model.
+function recordLookup(text:string,g:Grounding,catalog:Catalog):{sql:string;explain:string}|null|undefined{
+ if(!/^(what|which|who|where|show|tell|give|get|find|list)\b/.test(text))return undefined;
+ if(/\b(how many|count|number of|average|avg|mean|total|sum|max|min|most|fewest|least|per|each|every|latest|last|first|recent|when)\b/.test(text))return undefined;
+ const ids=g.mentions.filter(m=>m.kind==='value'&&m.confidence>=1&&(m.via==='lookup'||catalog.table(m.table).primaryKey===m.column||labelColumn(catalog.table(m.table))===m.column));
+ if(ids.length!==1||g.mentions.some(m=>m.kind==='value'&&m!==ids[0]))return undefined;
+ const id=ids[0],base=catalog.table(id.table);
+ const refs=(c:Table,p:Table)=>Boolean(p.primaryKey)&&c.relationships.includes(`${c.name}.${p.primaryKey} = ${p.name}.${p.primaryKey}`);
+ const parents:Table[]=[];
+ for(const m of g.mentions.filter(m=>m.kind==='table'&&m.table!==base.name)){
+  const t=catalog.table(m.table);if(!refs(base,t))return undefined;if(!parents.includes(t))parents.push(t);
+ }
+ const cols:{table:Table;column:string}[]=[];
+ // "upgrade status" ~ evergreen_status: a partial column match counts when the question names its last part.
+ const qWords=new Set(text.split(' '));
+ for(const m of g.mentions.filter(m=>m.kind==='column'&&(m.confidence>=0.9||m.confidence>=0.8&&qWords.has(m.column!.split('_').at(-1)!)))){
+  const t=catalog.table(m.table);if(t!==base&&!parents.includes(t))continue;
+  if(m.column===id.column||/_id$/.test(m.column!)||cols.some(c=>c.table===t&&c.column===m.column))continue;cols.push({table:t,column:m.column!});
+ }
+ for(const p of parents){const label=labelColumn(p);if(label&&!cols.some(c=>c.table===p&&c.column===label))cols.push({table:p,column:label});}
+ if(!cols.length)return undefined;
+ const select=[`${q(base.name)}.${q(id.column!)}`,...cols.map(c=>`${q(c.table.name)}.${q(c.column)}`)].join(', ');
+ const joins=parents.map(p=>` LEFT JOIN ${q(p.name)} ON ${q(base.name)}.${q(p.primaryKey!)} = ${q(p.name)}.${q(p.primaryKey!)}`).join('');
+ return {sql:`SELECT ${select} FROM ${q(base.name)}${joins} WHERE ${q(base.name)}.${q(id.column!)} = ${sqlLiteral(id.value!)} LIMIT 20`,
+  explain:`${cols.map(c=>c.column.replace(/_/g,' ')).join(', ')} of ${base.name} where ${id.column} = '${id.value}'`};
+}
+
+// "List the first 5 Windows servers by server ID": a filtered, ordered listing of one table.
+function firstRows(text:string,g:Grounding,catalog:Catalog):{sql:string;explain:string}|null|undefined{
+ const m=text.match(/^(?:list|show|give me|get|display)\s+(?:me\s+)?(?:the\s+)?(?:first|top)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(.+?)\s+(?:by|ordered by|sorted by)\s+(.+)$/);
+ if(!m)return undefined;
+ const n=Number(m[1])||NUMBER_WORDS.indexOf(m[1])+1;
+ const tables=[...new Set(g.mentions.filter(x=>x.kind==='table').map(x=>x.table))];if(tables.length!==1)return undefined;
+ const t=catalog.table(tables[0]);
+ const values=g.mentions.filter(x=>x.kind==='value');
+ if(values.some(v=>v.table!==t.name||v.confidence<0.9||v.via==='partial'))return undefined;
+ // The ordering phrase must name one column of this table.
+ const orderPhrase=m[3].trim().replace(/\s+/g,'_');
+ const order=t.columns.find(c=>c.name===orderPhrase||c.name===orderPhrase.replace(/s$/,''))||g.mentions.filter(x=>x.kind==='column'&&x.table===t.name&&x.confidence>=0.9&&norm(x.text)===m[3].trim()).map(x=>t.columns.find(c=>c.name===x.column)).at(0);
+ if(!order)return undefined;
+ const byCol=new Map<string,string[]>();for(const v of values){const list=byCol.get(v.column!)||[];if(!list.includes(v.value!))list.push(v.value!);byCol.set(v.column!,list);}
+ const where=[...byCol].map(([c,vs])=>vs.length===1?`${q(t.name)}.${q(c)} = ${sqlLiteral(vs[0])}`:`${q(t.name)}.${q(c)} IN (${vs.map(sqlLiteral).join(', ')})`);
+ const cols=[...new Set([t.primaryKey,...byCol.keys(),order.name].filter(Boolean) as string[])];
+ const desc=/\b(desc|descending|newest|latest|highest|largest)\b/.test(text)?' DESC':'';
+ return {sql:`SELECT ${cols.map(c=>`${q(t.name)}.${q(c)}`).join(', ')} FROM ${q(t.name)}${where.length?' WHERE '+where.join(' AND '):''} ORDER BY ${q(t.name)}.${q(order.name)}${desc} LIMIT ${n}`,
+  explain:`first ${n} ${t.name}${where.length?' where '+[...byCol].map(([c,vs])=>`${c} = '${vs.join("' or '")}'`).join(' and '):''} ordered by ${order.name}`};
+}
+
+// "vulnerabilities by severity and status": counts for every combination of two fields of one table.
+// Without this the single-label draft would silently drop the second field.
+function twoWayBreakdown(text:string,g:Grounding,catalog:Catalog):{sql:string;explain:string}|null|undefined{
+ const m=text.match(/\b(?:by|per|across) (?:the )?(.+?) and (?:by )?(?:the )?(.+?)$/);if(!m)return undefined;
+ const tables=[...new Set(g.mentions.filter(x=>x.kind==='table').map(x=>x.table))];
+ if(tables.length!==1)return null;
+ const t=catalog.table(tables[0]);
+ const field=(phrase:string)=>g.mentions.filter(x=>x.kind==='column'&&x.table===t.name&&x.confidence>=0.9&&norm(x.text)===phrase.trim()&&!/_id$/.test(x.column!))[0];
+ const a=field(m[1]),b=field(m[2]);
+ if(!a||!b||a.column===b.column)return null;
+ if(/\b(average|avg|mean|total|sum|max|min|top|most|least|percent|share|last|past|since|not|no|without)\b/.test(text))return null;
+ const vals=g.mentions.filter(x=>x.kind==='value'&&x.confidence>=0.9);
+ if(vals.some(v=>v.table!==t.name||v.via==='partial'))return null;
+ const where=vals.map(v=>`${q(t.name)}.${q(v.column!)} = ${sqlLiteral(v.value)}`);
+ const cols=[a.column!,b.column!].map(c=>`${q(t.name)}.${q(c)}`);
+ return {sql:`SELECT ${cols.join(', ')}, count(*) AS ${q(t.name+'_count')} FROM ${q(t.name)}${where.length?' WHERE '+where.join(' AND '):''} GROUP BY ${cols.join(', ')} ORDER BY ${cols.join(', ')}`,
+  explain:`count of ${t.name} by ${a.column} and ${b.column}${where.length?' where '+vals.map(v=>`${v.column} = '${v.value}'`).join(' and '):''}`};
+}
+
+// "which root cause has the longest average downtime", "which os has the highest total disk gb":
+// group by one attribute, aggregate one measure of the same table, rank by it.
+function rankedAggregate(text:string,g:Grounding,catalog:Catalog):{sql:string;explain:string}|null|undefined{
+ const m=text.match(/^(?:which|what)\s+(.+?)\s+(?:has|have|had|is|shows?)\s+(?:the\s+)?(highest|longest|largest|biggest|greatest|most|lowest|shortest|smallest|least)\s+(average|avg|mean|total|sum of|overall)\s+(.+?)\s*$/);
+ if(!m)return undefined;
+ const cols=g.mentions.filter(x=>x.kind==='column'&&x.confidence>=0.6);
+ const inPhrase=(x:Mention,phrase:string)=>norm(phrase).includes(norm(x.text));
+ const group=cols.filter(x=>inPhrase(x,m[1])&&!/_id$/.test(x.column!)&&!NUMERIC.test(catalog.table(x.table).columns.find(c=>c.name===x.column)?.type||''));
+ const measure=cols.filter(x=>inPhrase(x,m[4])&&NUMERIC.test(catalog.table(x.table).columns.find(c=>c.name===x.column)?.type||''));
+ const pairs=group.flatMap(gc=>measure.filter(mc=>mc.table===gc.table).map(mc=>({gc,mc})));
+ const tables=[...new Set(pairs.map(p=>p.gc.table))];
+ if(tables.length!==1)return undefined;
+ const {gc,mc}=pairs[0];const t=catalog.table(gc.table);
+ // Values may filter the same table ("which root cause has the highest average downtime for P1 incidents").
+ const values=g.mentions.filter(x=>x.kind==='value'&&x.confidence>=0.9&&x.via!=='partial');
+ if(values.some(v=>v.table!==t.name))return undefined;
+ if(unexplainedNumbers(g,[]).length)return undefined;
+ const agg=/total|sum|overall/.test(m[3])?'sum':'avg';const dir=/lowest|shortest|smallest|least/.test(m[2])?'ASC':'DESC';
+ const where=values.length?' WHERE '+values.map(v=>`${q(t.name)}.${q(v.column!)} = ${sqlLiteral(v.value!)}`).join(' AND '):'';
+ const alias=`${agg}_${mc.column}`;
+ return {sql:`SELECT ${q(t.name)}.${q(gc.column!)}, ${agg}(${q(t.name)}.${q(mc.column!)}) AS ${q(alias)} FROM ${q(t.name)}${where} GROUP BY 1 ORDER BY 2 ${dir} NULLS LAST, 1 LIMIT 1`,
+  explain:`${gc.column} with the ${dir==='DESC'?'highest':'lowest'} ${agg} ${mc.column}${values.length?' where '+values.map(v=>`${v.column} = '${v.value}'`).join(' and '):''}`};
+}
+
+// "how many upgrades are due in the next 30 days": a due-style date between the reference date and N days/weeks ahead.
+function dueWithin(text:string,g:Grounding,catalog:Catalog):{sql:string;explain:string}|null|undefined{
+ const m=text.match(/^how many\s+(.+?)\s+(?:are|is)?\s*(?:due|scheduled|planned|expiring|expire)\s+(?:in|within)\s+the\s+next\s+(\d+|seven|fourteen|thirty|ninety)\s+(days?|weeks?)\s*$/);
+ if(!m)return undefined;
+ const tables=[...new Set(g.mentions.filter(x=>x.kind==='table').map(x=>x.table))];if(tables.length!==1)return undefined;
+ const t=catalog.table(tables[0]);
+ const dueCols=t.columns.filter(c=>/DATE|TIME/.test(c.type)&&/(^|_)(due|deadline|target|scheduled|planned|expiry|expires)(_|$)/.test(c.name));
+ if(dueCols.length!==1||!catalog.referenceDate)return undefined;
+ const values=g.mentions.filter(x=>x.kind==='value'&&x.confidence>=0.9&&x.via!=='partial');
+ if(values.some(v=>v.table!==t.name)||g.unknownTerms.length)return undefined;
+ const words:Record<string,number>={seven:7,fourteen:14,thirty:30,ninety:90};
+ const days=(Number(m[2])||words[m[2]])*(/week/.test(m[3])?7:1);
+ const col=`${q(t.name)}.${q(dueCols[0].name)}`;const ref=`DATE '${catalog.referenceDate}'`;
+ const where=[`${col} >= ${ref}`,`${col} < ${ref} + INTERVAL ${/week/.test(m[3])?`${days/7} WEEK`:`${days} DAY`}`,...values.map(v=>`${q(t.name)}.${q(v.column!)} = ${sqlLiteral(v.value!)}`)];
+ return {sql:`SELECT count(*) AS ${q(t.name+'_count')} FROM ${q(t.name)} WHERE ${where.join(' AND ')}`,explain:`${t.name} with ${dueCols[0].name} in the next ${days} days (from ${catalog.referenceDate})`};
 }

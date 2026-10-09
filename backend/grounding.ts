@@ -1,3 +1,4 @@
+import {readFileSync} from 'node:fs';import {gunzipSync} from 'node:zlib';import {resolve} from 'node:path';
 // Deterministic grounding: maps the user's words (including typos, synonyms and acronyms) onto
 // discovered tables, columns and stored values. Everything is derived from the live catalog plus
 // optional semantic hints, so it works for any DuckDB database.
@@ -5,14 +6,16 @@ import type {Catalog,Table} from './catalog.js';
 import {identifier,sqlLiteral} from './db.js';
 
 export type Mention={text:string;kind:'table'|'column'|'value';table:string;column?:string;value?:string;confidence:number;via:'exact'|'synonym'|'acronym'|'partial'|'fuzzy'|'lookup';negated?:boolean};
-export type Grounding={question:string;normalized:string;corrections:{from:string;to:string}[];mentions:Mention[];unknownTerms:string[];tables:string[];definitions:string[]};
+export type Grounding={question:string;normalized:string;corrections:{from:string;to:string}[];mentions:Mention[];unknownTerms:string[];tables:string[];definitions:string[];
+ // Identifier-shaped names ("host-00010") that look like a column's values but match no stored record.
+ missingIdentifiers?:{token:string;table:string;column:string;example:string}[]};
 
 export const norm=(s:string)=>s.toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
 const words=(s:string)=>norm(s).split(' ').filter(Boolean);
 const singular=(w:string)=>w.endsWith('ies')?w.slice(0,-3)+'y':w.endsWith('sses')?w.slice(0,-2):w.endsWith('s')&&!w.endsWith('ss')&&w.length>3?w.slice(0,-1):w;
 
 // Common English and question words: never "corrected" into schema vocabulary.
-const COMMON=new Set(`a about above across after again against all almost also always am among an and another any anyone anything are area around as ask at available average avg away back bad be because been before being below best better between big both bottom break breakdown broken but by can cannot change compare compared contain contains count counts current currently data database day days did different do does doing done down during each either else empty enough entire entries entry ever every everything exactly exist exists fail failed failing fails few fewer find first for found fraction from full get give given go good greater group grouped had has have having he her here high higher highest him his hit how however i if in include including instead into is it its just keep kind know largest last latest least less let like list little long look lookup lot low lower lowest made make many max maximum may me mean mean median min minimum more most much must my name named names near need never new next no none nor not now number numbers of off often old older oldest on once one ones only or order other our out over overall own part per percent percentage pick please point possible previous rate rather ratio real record records related report result results return right row rows run running same say see select separate set several share she should show showing since single size small smallest so some something sort split sql still such sum summarize summary table tables tell than that the their them then there these they thing things this those though through tally time times to today together top total totals tried type types under unique until up us use used using value values very via want was we week weeks were what whatever when where whether which while who whole whose why will with within without would year years yes yet you your zero month months quarter quarters yesterday tomorrow ago past recent recently latest earliest newest oldest daily weekly monthly yearly one two three four five six seven eight nine ten eleven twelve twenty thirty forty fifty hundred thousand couple few several dozen random sample quarterly annually planning review reviews director manager quarter planned non excluding except without overdue due late patched date dates day days week weeks year years trend trends minute minutes hour hours second seconds gb mb tb kb gib cores core percent points handle handles handled handling manage manages managed managing own owns owned owning use uses used assigned work works working update delete insert create remove change modify rename drop truncate export import restore backup copy move set reset assign close reopen fix restart stop start add make send email write save upload download happened happen happens occurred occur occurs belong belongs belonging located hosted hosting running runs affected affecting impacted associated linked related attached found have having had has fewest fewer least smallest largest highest lowest biggest greatest longest shortest maximum minimum average mean median sum total count counts number numbers percent percentage proportion ratio rate share top bottom rank ranking compare comparison versus vs breakdown distribution overall altogether combined currently still ever never already any anything everything nothing across among between within under over above below whose which what who how many much`.split(/\s+/));
+const COMMON=new Set(`a about above across after again against all almost also always am among an and another any anyone anything are area around as ask at available average avg away back bad be because been before being below best better between big both bottom break breakdown broken but by can cannot change compare compared contain contains count counts current currently data database day days did different do does doing done down during each either else empty enough entire entries entry ever every everything exactly exist exists fail failed failing fails few fewer find first for found fraction from full get give given go good greater group grouped had has have having he her here high higher highest him his hit how however i if in include including instead into is it its just keep kind know largest last latest least less let like list little long look lookup lot low lower lowest made make many max maximum may me mean mean median min minimum more most much must my name named names near need never new next no none nor not now number numbers of off often old older oldest on once one ones only or order other our out over overall own part per percent percentage pick please point possible previous rate rather ratio real record records related report result results return right row rows run running same say see select separate set several share she should show showing since single size small smallest so some something sort split sql still such sum summarize summary table tables tell than that the their them then there these they thing things this those though through tally time times to today together top total totals tried type types under unique until up us use used using value values very via want was we week weeks were what whatever when where whether which while who whole whose why will with within without would year years yes yet you your zero month months quarter quarters yesterday tomorrow ago past recent recently latest earliest newest oldest daily weekly monthly yearly whats hows wheres whos overall insight insights stats statistics highlights doing summary summaries summarize summarise overview details detail history histories everything entire complete timeline lifecycle snapshot landscape joke jokes funny riddle laugh bring brief glance picture idea distinct affect affects affecting negative positive nonzero one two three four five six seven eight nine ten eleven twelve twenty thirty forty fifty hundred thousand couple few several dozen random sample quarterly annually planning review reviews director manager quarter planned non excluding except without overdue due late patched date dates day days week weeks year years trend trends minute minutes hour hours second seconds gb mb tb kb gib cores core percent points handle handles handled handling manage manages managed managing own owns owned owning use uses used assigned work works working update delete insert create remove change modify rename drop truncate export import restore backup copy move set reset assign close reopen fix restart stop start add make send email write save upload download happened happen happens occurred occur occurs belong belongs belonging located hosted hosting running runs affected affecting impacted associated linked related attached found have having had has fewest fewer least smallest largest highest lowest biggest greatest longest shortest maximum minimum average mean median sum total count counts number numbers percent percentage proportion ratio rate share top bottom rank ranking compare comparison versus vs breakdown distribution overall altogether combined currently still ever never already any anything everything nothing across among between within under over above below whose which what who how many much`.split(/\s+/));
 export const isCommonWord=(w:string)=>COMMON.has(norm(w));
 export const phraseInText=(haystack:string,needle:string)=>phraseIn(norm(haystack),norm(needle));
 const QUESTION_WORDS=new Set(`how many much what which who when where why is are was were do does did have has had there the a an of in on at for to by with and or me show list give tell count number total find get return all each every per our we us my i please can could would should`.split(' '));
@@ -48,10 +51,22 @@ function vocabulary(catalog:Catalog){
  const entry={version:catalog.version,vocab,set:new Set(weights.keys())};vocabCache.set(catalog,entry);return entry;
 }
 
+// English dictionary (Webster's 2nd, public domain; data/english-words.txt.gz) for telling real words from typos.
+let english:Set<string>|undefined;
+function isEnglishWord(w:string){
+ if(!english){try{english=new Set(gunzipSync(readFileSync(resolve('data/english-words.txt.gz'))).toString('utf8').split('\n'));}catch{english=new Set();}}
+ const forms=[w,w.replace(/ies$/,'y'),w.replace(/es$/,''),w.replace(/s$/,''),w.replace(/ed$/,''),w.replace(/ed$/,'e'),w.replace(/ing$/,''),w.replace(/ing$/,'e')];
+ return forms.some(f=>f.length>=4&&english!.has(f));
+}
+// Frequent misspellings of question words; schema vocabulary is corrected by edit distance below.
+const WORD_TYPOS:Record<string,string>={sever:'server',severs:'servers',bringup:'bring up',abou:'about',summery:'summary',sumary:'summary',summry:'summary',detials:'details',detales:'details',histroy:'history',wich:'which',whcih:'which',whihc:'which',witch:'which',waht:'what',wat:'what',hwo:'how',hw:'how',teh:'the',thier:'their',wiht:'with',wtih:'with',frm:'from',nmber:'number',numbr:'number',cuont:'count',mnay:'many',mny:'many',shwo:'show',lsit:'list',whre:'where',wher:'where',becuase:'because',averge:'average',avrage:'average',totla:'total'};
 export function correctTypos(question:string,catalog:Catalog){
  const {vocab,set}=vocabulary(catalog);const corrections:{from:string;to:string}[]=[];
+ // "high level" means overall, not severity High.
+ question=question.replace(/\bhigh[- ]level\b/gi,'overall');
  const corrected=question.replace(/[A-Za-z]+/g,token=>{
   const w=token.toLowerCase();
+  if(WORD_TYPOS[w]&&!set.has(w)){corrections.push({from:token,to:WORD_TYPOS[w]});return WORD_TYPOS[w];}
   if(w.length<4||set.has(w)||set.has(singular(w))||COMMON.has(w)||COMMON.has(singular(w)))return token;
   // Inflections of known words ("opened", "running", "patched") are not typos.
   const stem=w.replace(/(ing|ed|es|s|er|ers|ly|d)$/,'');if(stem.length>=3&&(set.has(stem)||COMMON.has(stem)||set.has(stem+'e')||COMMON.has(stem+'e')))return token;
@@ -61,6 +76,10 @@ export function correctTypos(question:string,catalog:Catalog){
   // Different word forms of one root ("operating" vs "operations") are not typos.
   const suffix=(x:string)=>x.match(/(ing|ed|ion|ions|er|ers|ment|ments|ly|ive|al)$/)?.[0];
   if(suffix(w)&&suffix(best.word)&&suffix(w)!==suffix(best.word))return token;
+  // A real English word ("details", "sever") is only a typo when it is one edit away from a schema word;
+  // "details" is not a misspelling of "retail".
+  // Short real words ("dive", "form") are kept even one edit away: too many neighbours to guess safely.
+  if((best.d>=2||w.length<=5)&&isEnglishWord(w))return token;
   // "unresolved" is the negation of "resolved", not a typo of it.
   if(/^(un|non|in|im|dis|ir|il)/.test(w)&&w.replace(/^(un|non|in|im|dis|ir|il)-?/,'')===best.word)return token;
   corrections.push({from:token,to:best.word});return best.word;
@@ -82,7 +101,9 @@ export function groundSync(question:string,catalog:Catalog):Grounding{
  // Tables
  for(const t of tables){
   const names=[t.name,singular(t.name),t.name.replaceAll('_',' '),...(catalog.semantic.tableSynonyms[t.name]||[])].map(norm);
-  const hit=names.find(x=>phraseIn(n,x));if(hit)mentions.push({text:hit,kind:'table',table:t.name,confidence:1,via:hit===norm(t.name)||hit===singular(norm(t.name))?'exact':'synonym'});
+  // Longest synonym first, plural forms included ("os upgrades" ~ "os upgrade").
+  const variants=[...new Set(names.flatMap(x=>[x,x.endsWith('s')?x:x+'s']))].sort((a,b)=>b.length-a.length);
+  const hit=variants.find(x=>phraseIn(n,x));if(hit)mentions.push({text:hit,kind:'table',table:t.name,confidence:1,via:hit===norm(t.name)||hit===singular(norm(t.name))?'exact':'synonym'});
  }
  // Columns
  for(const t of tables)for(const c of t.columns){
@@ -103,9 +124,9 @@ export function groundSync(question:string,catalog:Catalog):Grounding{
  {
   const firstWords=new Map<string,{table:string;column:string}[]>();
   for(const t of tables)for(const c of t.columns){const parts=c.name.split('_');if(parts.length<2||c.type==='BOOLEAN')continue;const f=parts[0];if(f.length<4||COMMON.has(f))continue;firstWords.set(f,[...(firstWords.get(f)||[]),{table:t.name,column:c.name}]);}
-  for(const w of new Set(words(n))){const cols=firstWords.get(w);if(!cols||cols.length!==1)continue;
+  for(const word of new Set(words(n))){const w=firstWords.has(word)?word:singular(word);const cols=firstWords.get(w);if(!cols||cols.length!==1)continue;
    const tb=catalog.tables.find(t=>t.name===cols[0].table)!;if(norm(tb.name).startsWith(w)||singular(norm(tb.name))===w)continue;
-   if(!mentions.some(m=>m.kind==='column'&&m.column===cols[0].column))mentions.push({text:w,kind:'column',table:cols[0].table,column:cols[0].column,confidence:0.8,via:'partial'});}
+   if(!mentions.some(m=>m.kind==='column'&&m.column===cols[0].column))mentions.push({text:word,kind:'column',table:cols[0].table,column:cols[0].column,confidence:0.8,via:'partial'});}
  }
  // Boolean flags named by their distinctive word: "have an exploit" -> exploit_available, "is regulated" -> regulated.
  for(const t of tables)for(const c of t.columns){
@@ -132,8 +153,10 @@ export function groundSync(question:string,catalog:Catalog):Grounding{
     const unit=occurrences.length>0&&occurrences.every(isUnit);
     if(!unit&&(originalTokens.includes(v)||(/\d/.test(v)&&originalTokens.some(tok=>tok.toLowerCase()===nv))))mentions.push({text:v,kind:'value',table:t.name,column:c.name,value:v,confidence:1,via:'exact'});continue;}
    if(phraseIn(n,nv)){mentions.push({text:nv,kind:'value',table:t.name,column:c.name,value:v,confidence:1,via:'exact'});continue;}
+   // "under investigation" ~ Investigating: the -ation noun of a stored verb form is the same state.
+   if(!nv.includes(' ')&&nv.length>=6){const noun=(x:string)=>x.replace(/(ations?|ating|ated|ates?|ions?|ing|ed)$/,'');const hit=words(n).find(w=>/(ation|ion)s?$/.test(w)&&noun(w).length>=6&&noun(w)===noun(nv));if(hit){mentions.push({text:hit,kind:'value',table:t.name,column:c.name,value:v,confidence:0.9,via:'synonym'});continue;}}
    // Inflected forms: "fail" ~ Failed, "remediate" ~ Remediated, "blocking" ~ Blocked.
-   if(!nv.includes(' ')&&nv.length>=4){const stem=(x:string)=>x.replace(/(ful|fully|ly|ing|ed|es|s|d|e)$/,'');const hit=words(n).find(w=>w.length>=4&&w!==nv&&!/^(day|days|week|weeks|month|months|year|years|quarter|quarters|hour|hours|minute|minutes|time|times|date|dates)$/.test(w)&&(stem(w)===stem(nv)||stem(w)===nv)&&!(/(ed|ing)$/.test(w)&&!/(ed|ing)$/.test(nv)));if(hit){mentions.push({text:hit,kind:'value',table:t.name,column:c.name,value:v,confidence:0.85,via:'partial'});continue;}}
+   if(!nv.includes(' ')&&nv.length>=4){const stem=(x:string)=>x.replace(/(ful|fully|ly|ing|ed|es|s|d|e)$/,'');const derive=(x:string)=>x.replace(/(eeded|eeding|eeds|eed|essfully|essful|ess|ures|ure)$/,'');const hit=words(n).find(w=>w.length>=4&&w!==nv&&!/^(day|days|week|weeks|month|months|year|years|quarter|quarters|hour|hours|minute|minutes|time|times|date|dates)$/.test(w)&&(((stem(w)===stem(nv)||stem(w)===nv)&&!(/(ed|ing)$/.test(w)&&!/(ed|ing)$/.test(nv)))||(derive(w)!==w&&derive(w).length>=4&&derive(w)===derive(nv)&&!/ly$/.test(words(n)[words(n).indexOf(w)-1]||''))));if(hit){mentions.push({text:hit,kind:'value',table:t.name,column:c.name,value:v,confidence:0.85,via:'partial'});continue;}}
    const a=acronym(v);if(a&&phraseIn(n,a)){mentions.push({text:a,kind:'value',table:t.name,column:c.name,value:v,confidence:0.9,via:'acronym'});continue;}
    if(c.values.includes(v)){
     const distinctive=words(v).filter(w=>w.length>=4&&!/\d/.test(w)&&wordFreq.get(w)===1&&!COMMON.has(w)&&!schemaWords.has(w)&&!schemaWords.has(singular(w)));
@@ -153,21 +176,31 @@ export function groundSync(question:string,catalog:Catalog):Grounding{
 // numerous to keep in memory.
 export async function ground(question:string,catalog:Catalog):Promise<Grounding>{
  const g=groundSync(question,catalog);
- const tokens=[...new Set([...question.matchAll(/'([^']{2,60})'|"([^"]{2,60})"|\b([A-Za-z]+[-_][A-Za-z0-9-_]*\d[A-Za-z0-9-_]*|[A-Za-z]*\d+[A-Za-z]+[A-Za-z0-9-]*)\b/g)].map(m=>m[1]||m[2]||m[3]))].slice(0,6);
+ const tokens=[...new Set([...question.matchAll(/'([^']{2,60})'|"([^"]{2,60})"|\b([A-Za-z]+[-_][A-Za-z0-9-_]*\d[A-Za-z0-9-_]*|[A-Za-z]*\d+[A-Za-z]+[A-Za-z0-9-]*)\b|\b([A-Z][A-Za-z]+(?: [A-Z][A-Za-z]+){0,2} \d+)\b/g)].map(m=>m[1]||m[2]||m[3]||m[4]))].slice(0,6);
+ // Multi-word names ("Payments 1", "Identity 8") in columns too large to keep in memory.
  const shape=(s:string)=>s.replace(/[A-Za-z]/g,'a').replace(/\d/g,'9').replace(/a+/g,'a').replace(/9+/g,'9');
- const lookups:Promise<void>[]=[];
+ const lookups:Promise<void>[]=[];const candidates:NonNullable<Grounding['missingIdentifiers']>=[];
  for(const token of tokens){
   if(g.mentions.some(m=>m.kind==='value'&&m.value?.toLowerCase()===token.toLowerCase()))continue;
   for(const t of catalog.tables)for(const c of t.columns){
    if(!c.type.includes('VARCHAR')||c.values.length||c.lookup.length&&!c.lookup.some(v=>String(v).toLowerCase()===token.toLowerCase()))continue;
    if(!c.representatives.some(r=>typeof r==='string'&&shape(r)===shape(token)))continue;
+   const prefix=(v:string)=>v.replace(/\d+/g,'9').toLowerCase();
+   const same=c.representatives.find(r=>typeof r==='string'&&prefix(r)===prefix(token));
+   if(same!==undefined)candidates.push({token,table:t.name,column:c.name,example:String(same)});
    lookups.push(catalog.db.query(`SELECT ${identifier(c.name)} AS v FROM ${identifier(t.name)} WHERE lower(${identifier(c.name)})=lower(${sqlLiteral(token)}) LIMIT 1`,1).then(r=>{
     if(r.rows.length)g.mentions.push({text:token,kind:'value',table:t.name,column:c.name,value:String(r.rows[0].v),confidence:1,via:'lookup'});
    }).catch(()=>{}));
   }
  }
  await Promise.all(lookups);
- return finish(question,g.normalized,g.corrections,dedupe(g.mentions),catalog);
+ const result=finish(question,g.normalized,g.corrections,dedupe(g.mentions),catalog);
+ // Only code-like identifiers ("SRV-00003", "host-00010"), never multi-word names, count as missing.
+ const missing=candidates.filter(c=>/^[A-Za-z]+[-_]?\d[\w-]*$/.test(c.token)&&!result.mentions.some(m=>m.kind==='value'&&m.value?.toLowerCase()===c.token.toLowerCase()));
+ // Report each token against the table that owns it (primary key) rather than a table that references it.
+ const rank=(m:{table:string;column:string})=>catalog.table(m.table).primaryKey===m.column?0:1;
+ const byToken=[...new Map([...missing].sort((a,b)=>rank(b)-rank(a)).map(m=>[m.token,m])).values()];
+ return byToken.length?{...result,missingIdentifiers:byToken}:result;
 }
 
 function dedupe(mentions:Mention[]){
@@ -181,6 +214,9 @@ function dedupe(mentions:Mention[]){
 
 function finish(question:string,normalizedQuestion:string,corrections:{from:string;to:string}[],mentions:Mention[],catalog:Catalog):Grounding{
  const n=norm(normalizedQuestion);
+ // A column word inside a table phrase ("os" in "os upgrades") is part of the table's name.
+ const tablePhrases=mentions.filter(m=>m.kind==='table'&&m.text.includes(' ')).map(m=>' '+m.text+' ');
+ mentions=mentions.filter(m=>!(m.kind==='column'&&!m.text.includes(' ')&&tablePhrases.some(p=>p.includes(' '+m.text+' '))));
  // "country" inside "headquarters country": the longer column phrase wins.
  const longColumns=mentions.filter(m=>m.kind==='column'&&m.text.includes(' ')&&m.confidence>=0.9).map(m=>' '+m.text+' ');
  mentions=mentions.filter(m=>!(m.kind==='column'&&!m.text.includes(' ')&&longColumns.some(p=>p.includes(' '+m.text+' '))));
@@ -319,7 +355,8 @@ export function groundingGap(g:Grounding){
 // in the database: answering anyway would mean guessing.
 export function unknownSubject(g:Grounding){
  const m=norm(g.normalized).match(/^(?:(?:what|whats|what s)\s+(?:is|are|was|were)?\s*|show(?: me)?\s+|list\s+|give me\s+|how much\s+|tell me\s+)(?:the\s+|all\s+|our\s+|total\s+|average\s+)*(\w+)/);
- const head=m?.[1];
+ // "revenue by month": an unknown word heading a breakdown is the subject too.
+ const head=m?.[1]||(g.mentions.some(x=>x.kind==='table')?undefined:norm(g.normalized).match(/^(?:(?:the|our|total|average)\s+)*(\w+)\s+(?:by|per|over|trend)\b/)?.[1]);
  return head&&g.unknownTerms.includes(head)?head:undefined;
 }
 

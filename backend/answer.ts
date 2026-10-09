@@ -52,6 +52,7 @@ function allowedNumbers(evidence:Evidence[]){
  const cells:number[]=[];const add=(n:number)=>{if(Number.isFinite(n))cells.push(n);};
  for(const e of evidence){
   add(e.rowCount);add(e.rows.length);if(e.totalRows)add(e.totalRows);
+  for(const s of (e.summary as {min?:unknown;max?:unknown;avg?:number;sum?:number;distinct?:number;top?:{count:number}[]}[]|undefined)||[]){for(const v of [s.min,s.max,s.avg,s.sum,s.distinct])if(typeof v==='number')add(v);for(const t of s.top||[])add(t.count);}
   const cols=Object.keys(e.rows[0]||{});
   for(const r of e.rows)for(const c of cols){const v=r[c];if(isNum(v))add(v as number);else if(typeof v==='string'){for(const m of v.matchAll(/-?\d+(?:\.\d+)?/g))add(Number(m[0]));}}
   for(const c of cols){const nums=e.rows.map(r=>r[c]).filter(isNum) as number[];if(nums.length>1){const sum=nums.reduce((a,b)=>a+b,0);add(sum);add(sum/nums.length);}}
@@ -63,7 +64,7 @@ function allowedNumbers(evidence:Evidence[]){
 }
 const closeTo=(x:number,y:number,text:string)=>{const decimals=(text.split('.')[1]||'').replace(/\D/g,'').length;return Math.abs(x-y)<=Math.max(0.5*10**-decimals,Math.abs(y)*0.005)+1e-9;};
 
-export function verifyProse(text:string,evidence:Evidence[],question:string){
+export function verifyProse(text:string,evidence:Evidence[],question:string,knownValues:string[]=[]){
  const problems:string[]=[];
  const evidenceText=JSON.stringify(evidence.map(e=>e.rows)).toLowerCase();
  let rest=text;
@@ -78,6 +79,14 @@ export function verifyProse(text:string,evidence:Evidence[],question:string){
   if(Number.isInteger(n)&&n>=0&&n<=10&&!base.length)continue;
   problems.push('number '+m[0]+' not supported by results');
  }
+ // A stored category the results never mention ("runs on Linux" when the query never read the OS) is invented.
+ const summaryText=JSON.stringify(evidence.map(e=>e.summary??null)).toLowerCase();
+ for(const v of knownValues){
+  if(v.length<3||/^\d/.test(v))continue;
+  if(!new RegExp('\\b'+v.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\b').test(text))continue;
+  const lower=v.toLowerCase();if(evidenceText.includes(lower)||summaryText.includes(lower)||question.toLowerCase().includes(lower))continue;
+  problems.push('value '+v+' not in results');
+ }
  const hasRows=evidence.some(e=>e.rows.length);
  if(hasRows&&/\b(no|zero) (matching )?(records|results|rows|data)\b|\bnot found\b|\bcould not find\b/i.test(text)&&!evidence.every(e=>e.rows.length===1&&Object.values(e.rows[0]).every(v=>v===0||v===null)))problems.push('claims no data although rows exist');
  if(!text.trim())problems.push('empty');
@@ -86,19 +95,19 @@ export function verifyProse(text:string,evidence:Evidence[],question:string){
 }
 
 const proseSchema=z.object({answer:z.string().min(1).max(1200)});
-export async function composeAnswer(question:string,evidence:Evidence[],llm:Model,trace:Trace,opts:{rows:number;notes?:string[];draft?:string;templateForTables?:boolean}){
+export async function composeAnswer(question:string,evidence:Evidence[],llm:Model,trace:Trace,opts:{rows:number;notes?:string[];draft?:string;templateForTables?:boolean;knownValues?:string[]}){
  const template=templateAnswer(evidence);
  // Small models summarise multi-row tables poorly; the deterministic summary is clearer.
  if(opts.templateForTables&&!opts.draft&&evidence.some(e=>e.rows.length>3))return {text:template,source:'template' as const,problems:[]};
- if(opts.draft){const check=verifyProse(opts.draft,evidence,question);if(check.ok)return {text:opts.draft,source:'model' as const,problems:[]};trace.answerCheck={draft:opts.draft,problems:check.problems};}
+ if(opts.draft){const check=verifyProse(opts.draft,evidence,question,opts.knownValues);if(check.ok)return {text:opts.draft,source:'model' as const,problems:[]};trace.answerCheck={draft:opts.draft,problems:check.problems};}
  // Trivial single values do not need a model call to read well.
  const remaining=(trace.deadlineMs||Infinity)-Date.now();
  if(remaining<8000)return {text:template,source:'template' as const,problems:[]};
  try{
   const prose=await llm(proseSchema,'Answer writing','You answer a user question using ONLY the SQL query results provided. Write 1-3 short sentences in plain English. Start with the direct answer. Copy numbers exactly as they appear in the results (you may round decimals). Do not mention SQL, tables or queries. Do not add facts, causes or advice that are not in the results. If results are empty, say nothing matched.',
-   {question,results:evidence.map(e=>({purpose:e.objective,columns:Object.keys(e.rows[0]||{}),rows:e.rows.slice(0,opts.rows),totalRows:e.totalRows??e.rowCount,truncated:e.truncated})),notes:opts.notes?.length?opts.notes:undefined},
+   {question,results:evidence.map(e=>({purpose:e.objective,columns:Object.keys(e.rows[0]||{}),rows:e.rows.slice(0,opts.rows),totalRows:e.totalRows??e.rowCount,truncated:e.truncated,summaryOfAllRows:e.summary})),notes:opts.notes?.length?opts.notes:undefined},
    {...trace,deadlineMs:Math.min(trace.deadlineMs||Infinity,Date.now()+20000)},{maxTokens:400});
-  const check=verifyProse(prose.answer,evidence,question);
+  const check=verifyProse(prose.answer,evidence,question,opts.knownValues);
   if(check.ok&&prose.answer.trim().split(/\s+/).length<4)return {text:template,source:'template' as const,problems:['too terse']};
   if(check.ok)return {text:prose.answer.trim(),source:'model' as const,problems:[]};
   trace.answerCheck={draft:prose.answer,problems:check.problems};

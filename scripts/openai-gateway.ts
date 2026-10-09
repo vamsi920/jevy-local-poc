@@ -5,16 +5,24 @@
 //   LLM_PROVIDER=openai LLM_BASE_URL=http://127.0.0.1:8787/v1 LLM_API_KEY=test LLM_MODEL=qwen3:0.6b npm run battery
 import express from 'express';
 const port=Number(process.env.GATEWAY_PORT||8787),key=process.env.GATEWAY_KEY||'',ollama=process.env.OLLAMA_URL||'http://127.0.0.1:11434';
+// Simulate a shared enterprise endpoint: added network latency (ms, +/-50% jitter) and a share of
+// requests rejected with 429/503 (Retry-After: 1), e.g. GATEWAY_DELAY_MS=1500 GATEWAY_FAIL_RATE=0.2.
+const delayMs=Number(process.env.GATEWAY_DELAY_MS||0),failRate=Number(process.env.GATEWAY_FAIL_RATE||0);
+let served=0,rejected=0;
 const app=express();app.use(express.json({limit:'4mb'}));
 app.use((req,res,next)=>{if(key&&req.headers.authorization!=='Bearer '+key)return res.status(401).json({error:{message:'invalid api key'}});next();});
-app.get('/v1/models',async(_req,res)=>{const j=await fetch(ollama+'/api/tags').then(r=>r.json()) as {models:{name:string}[]};res.json({object:'list',data:j.models.map(m=>({id:m.name,object:'model'}))});});
+app.get('/v1/models',async(_req,res)=>{let j:{models:{name:string}[]};try{j=await fetch(ollama+'/api/tags').then(r=>r.json()) as {models:{name:string}[]};}catch{return res.status(502).json({error:{message:'upstream unavailable'}});}res.json({object:'list',data:j.models.map(m=>({id:m.name,object:'model'}))});});
 app.post('/v1/chat/completions',async(req,res)=>{
+ if(delayMs)await new Promise(r=>setTimeout(r,delayMs*(0.5+Math.random())));
+ if(Math.random()<failRate){rejected++;res.setHeader('Retry-After','1');return res.status(Math.random()<0.5?429:503).json({error:{message:'busy, retry later'}});}
+ served++;if(served%25===0)console.log(`served ${served}, rejected ${rejected}`);
  const b=req.body;
  const messages=(b.messages||[]).map((m:any)=>({role:m.role,content:m.content??'',...(m.tool_calls?{tool_calls:m.tool_calls.map((c:any)=>({function:{name:c.function.name,arguments:JSON.parse(c.function.arguments||'{}')}}))}:{})}));
  const body:any={model:b.model,stream:false,messages,options:{temperature:b.temperature??0.7,num_predict:b.max_tokens??1024,seed:b.seed,num_ctx:8192},think:false};
  if(b.tools)body.tools=b.tools;
  if(b.response_format?.type==='json_schema')body.format=b.response_format.json_schema.schema;else if(b.response_format?.type==='json_object')body.format='json';
- const r=await fetch(ollama+'/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+ // Upstream hiccups become a 502 (retryable for clients) instead of crashing the gateway.
+ let r:Response;try{r=await fetch(ollama+'/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}catch(e){return res.status(502).json({error:{message:'upstream unavailable: '+String(e)}});}
  if(!r.ok)return res.status(r.status).json({error:{message:await r.text()}});
  const j=await r.json() as any;
  res.json({id:'chatcmpl-'+Date.now(),object:'chat.completion',model:b.model,choices:[{index:0,finish_reason:j.done_reason==='length'?'length':j.message.tool_calls?'tool_calls':'stop',

@@ -4,7 +4,7 @@ import {createRoot} from 'react-dom/client';
 import {api,storage,type Conversation,type Health,type ModelInfo,type Turn} from './api';
 import {Sidebar} from './Sidebar';
 import {ModelPicker} from './ModelPicker';
-import {ThinkingLive} from './Thinking';
+import {Trace} from './Thinking';
 import {AnswerView} from './Answer';
 import './style.css';
 
@@ -30,8 +30,9 @@ function App(){
 
  const refreshHistory=useCallback(()=>api.conversations().then(r=>setConversations(r.conversations)).catch(()=>{}),[]);
  useEffect(()=>{
-  const ping=()=>api.health().then(setHealth).catch(()=>setHealth(undefined));ping();const id=setInterval(ping,15000);
-  api.models().then(r=>{setModels(r.models);setModel(m=>r.models.some(x=>x.name===m)?m:r.models.some(x=>x.name===r.default)?r.default:r.models[0]?.name||'');}).catch(()=>{});
+  const loadModels=()=>api.models().then(r=>{if(!r.models.length)return;setModels(r.models);setModel(m=>r.models.some(x=>x.name===m)?m:r.models.some(x=>x.name===r.default)?r.default:r.models[0]?.name||'');}).catch(()=>{});
+  // A busy model server can miss the first listing; keep asking until models arrive.
+  const ping=()=>api.health().then(h=>{setHealth(h);setModels(ms=>{if(!ms.length)loadModels();return ms;});}).catch(()=>setHealth(undefined));ping();loadModels();const id=setInterval(ping,15000);
   api.suggestions().then(r=>setSuggestions(r.suggestions)).catch(()=>{});
   refreshHistory();return()=>clearInterval(id);
  },[refreshHistory]);
@@ -75,7 +76,7 @@ function App(){
  async function rename(id:string,t:string){await api.rename(id,t).catch(()=>{});if(id===activeId)setTitle(t);refreshHistory();}
  async function remove(id:string){try{await api.remove(id);if(id===activeId)newConversation();refreshHistory();}catch(e){alert(e instanceof Error?e.message:String(e));}}
 
- const offline=!health?'Connecting to the local service…':!health.online?'Ollama is offline — start it with: ollama serve':!models.length?'No local model installed — run: ollama pull qwen3:4b':'';
+ const offline=!health?'Connecting to the local service…':!health.online?'Ollama is offline — start it with: ollama serve':!models.length&&!health.models.length?'No model available — check the model server.':'';
  return <div className={'app'+(collapsed?' side-collapsed':'')}>
   <Sidebar conversations={conversations} activeId={activeId} collapsed={collapsed} mobileOpen={mobileOpen} busyId={busy?activeId:undefined}
    onToggle={()=>setCollapsed(!collapsed)} onNew={newConversation} onOpen={openConversation} onRename={rename} onDelete={remove} onCloseMobile={()=>setMobileOpen(false)} debug={debug} onDebug={()=>setDebug(!debug)}/>
@@ -99,9 +100,9 @@ function App(){
       <div className="assistant">
        <div className="avatar" aria-hidden="true">j</div>
        <div className="assistant-body">
+        <Trace events={t.events} live={!t.answer&&!t.error} startedAt={t.startedAt} totalMs={t.answer?.trace.totalMs} calls={t.answer?.trace.llm.length} retries={t.answer?.trace.retries} model={t.model}/>
         {t.answer?<AnswerView answer={t.answer} fresh={!!t.fresh} model={t.model} debug={debug} onRetry={()=>send(t.question)}/>:
-         t.error?<div className="error-card"><strong>Something went wrong</strong><p>{t.error}</p><button onClick={()=>send(t.question)} disabled={busy}>Try again</button></div>:
-         <ThinkingLive events={t.events} startedAt={t.startedAt}/>}
+         t.error?<div className="error-card"><strong>Something went wrong</strong><p>{t.error}</p><button onClick={()=>send(t.question)} disabled={busy}>Try again</button></div>:null}
        </div>
       </div>
       {i===turns.length-1&&<div ref={end}/>}

@@ -24,6 +24,15 @@ export async function normalizeSQL(sql:string,catalog:Catalog,question='',allowT
  const grounding=options.grounding||groundSync(question,catalog);
  const root=ast.statements[0].node;
  const sourceTables=catalog.tables.filter(t=>new RegExp('\\b'+t.name+'\\b','i').test(sql));
+ // An aggregate divided by itself is always 1 (100%): a share needs the total, e.g. sum(count(*)) OVER ().
+ if(/\b((?:count|sum)\s*\((?:\*|[\w."]+)\))\s*(?:\*\s*1(?:00)?(?:\.0+)?\s*)?\/\s*(?:nullif\s*\(\s*)?\1/i.test(sql.replace(/\s+/g,' ')))throw new Error('This divides an aggregate by itself, which is always 1 (100%). For each group\'s share, divide by the overall total: count(*) * 100.0 / sum(count(*)) OVER ().');
+ // Pattern filters (LIKE '%open%') must use a word the user actually wrote, not a fragment of another
+ // word ("opensl" -> '%open%') — otherwise they quietly drop rows.
+ if(question)for(const m of sql.matchAll(/(?:NOT\s+)?(?:I?LIKE|~~\*?|SIMILAR TO)\s+'([^']*)'/gi)){
+  const core=m[1].replace(/[%_]+/g,' ').trim();if(!core)continue;
+  const allowed=(options.allowedLiterals||[]).some(l=>l.toLowerCase().includes(core.toLowerCase()));
+  if(!allowed&&!phraseInText(question,core)&&!phraseInText(grounding.normalized,core))throw new Error(`Pattern filter '${m[1]}' is not something the question asks for. Remove it; filter only on what the user asked.`);
+ }
 
  // 1. Relative dates must use the dataset reference date, never the host clock.
  if(catalog.referenceDate){
@@ -162,11 +171,22 @@ export async function normalizeSQL(sql:string,catalog:Catalog,question='',allowT
   const mentioned=new Set(grounding.mentions.filter(m=>m.value).map(m=>m.value!.toLowerCase()));
   for(const p of predicates){
    const literal=p.value;const lower=literal.toLowerCase();
+   // An identifier compared against a column whose values look different ("SRV-00001" vs EVG-...) matches nothing.
+   const idShape=(v:string)=>/^[A-Za-z]+[-_]?\d[\w-]*$/.test(v)?v.replace(/\d+/g,'9').toUpperCase():'';
+   if(idShape(literal)){
+    const col=sourceTables.map(t=>t.columns.find(c=>c.name===p.column)).find(Boolean);
+    const reps=(col?.representatives||[]).filter((r):r is string=>typeof r==='string');
+    if(col&&reps.length&&reps.every(r=>idShape(r))&&!col.values.map(String).includes(literal)&&reps.every(r=>idShape(r)!==idShape(literal))){
+     const home=sourceTables.flatMap(t=>t.columns.filter(c=>c!==col&&(c.representatives||[]).some(r=>typeof r==='string'&&idShape(r)===idShape(literal))).map(c=>t.name+'.'+c.name));
+     throw new Error(`'${literal}' does not look like a ${p.column} value (e.g. '${reps[0]}').${home.length?` It looks like ${home.slice(0,3).join(', ')}; filter that column instead.`:''}`);
+    }
+   }
    if(/^\d{4}-\d{2}-\d{2}/.test(literal)||allowed.has(lower)||mentioned.has(lower))continue;
    const owners=sourceTables.map(t=>({t,c:t.columns.find(c=>c.name===p.column)})).filter(x=>x.c);
    if(!owners.length)continue;
    const known=owners.flatMap(o=>[...o.c!.values,...o.c!.lookup]).map(String);
-   const complete=owners.every(o=>o.c!.values.length||o.c!.lookup.length);
+   // Value lists profiled from a sample (very large tables) are not complete; absence proves nothing.
+   const complete=owners.every(o=>(o.c!.values.length||o.c!.lookup.length)&&!o.c!.sampled);
    const stored=known.includes(literal);
    const inQuestion=phraseInText(grounding.normalized,literal)||phraseInText(question,literal);
    if(stored&&inQuestion)continue;
@@ -176,6 +196,12 @@ export async function normalizeSQL(sql:string,catalog:Catalog,question='',allowT
    if(grounding.unknownTerms.some(t=>/^(un|non|in|dis|im)-?/.test(t)&&t.replace(/^(un|non|in|dis|im)-?/,'').startsWith(lower.slice(0,Math.max(4,lower.length-2))))&&!predicates.some(o=>o.column===p.column&&o.value===literal&&o.negated))throw new Error(`The question negates "${literal}" (e.g. "un${lower}"): use ${p.column} <> '${literal}' or the matching NULL/other statuses, not = '${literal}'.`);
    // A column the user already constrained ("partially succeeded" -> Partial) gets no extra guessed values.
    if(stored&&predicates.some(o=>o.column===p.column&&o.value!==literal&&mentioned.has(o.value.toLowerCase())))throw new Error(`Filter ${p.column} = '${literal}' was not requested; the question asks only for ${p.column} = '${predicates.find(o=>o.column===p.column&&mentioned.has(o.value.toLowerCase()))!.value}'.`);
+   // Guessing that an unknown word means a stored value is only plausible for proper nouns the user
+   // capitalised ("Germany" -> DE); for ordinary words ("negative downtime") it invents a filter.
+   const capitalised=(t:string)=>new RegExp('\\b'+t.charAt(0).toUpperCase()+t.slice(1)+'\\b').test(question);
+   const describes=(t:string)=>grounding.mentions.some(m=>m.kind==='column'&&new RegExp('\\b'+t+'\\s+'+norm(m.text).replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\b').test(norm(question)));
+   const plainWords=mapping.filter(describes);
+   if(stored&&plainWords.length&&!mapping.some(capitalised))throw new Error(`Filter ${p.column} = '${literal}' was not requested by the question. Remove it; filter only on what the user asked.`);
    if(stored&&mapping.length){notes.push(`Assumed ${mapping.map(t=>`"${t}"`).join(', ')} means ${p.column} = '${literal}'.`);continue;} // plausible mapping of a user term (e.g. Germany -> DE)
    if(stored)throw new Error(`Filter ${p.column} = '${literal}' was not requested by the question. Remove it; filter only on what the user asked.`);
    const elsewhere=catalog.tables.flatMap(t=>t.columns.filter(c=>c.values.includes(literal)||c.lookup.includes(literal)).map(c=>t.name+'.'+c.name)).filter(x=>!owners.some(o=>x===o.t.name+'.'+p.column));
@@ -439,6 +465,15 @@ export async function normalizeSQL(sql:string,catalog:Catalog,question='',allowT
   }
   // 7. "by X"/"per X"/"each X" requires X labels in grouped output.
   const projected=(root.select_list||[]) as Node[];const lower=question.toLowerCase();
+  // 7a. The requested grouping field lives in a table the query never reads ("average downtime by environment"
+  // grouped by priority): join that table instead of grouping by something else.
+  if(projected.some(e=>e.class==='FUNCTION'&&AGGREGATES.includes(e.function_name?.toLowerCase()))&&root.type==='SELECT_NODE'){
+   for(const m of grounding.mentions.filter(m=>m.kind==='column'&&m.confidence>=0.9&&!/_id$/.test(m.column!))){
+    if(!new RegExp('\\b(?:by|each|per|every)\\s+(?:the\\s+)?'+norm(m.text)+'\\b').test(norm(question)))continue;
+    if(sourceTables.some(t=>t.columns.some(c=>c.name===m.column)))continue;
+    throw new Error(`The question groups by ${m.table}.${m.column}, but the query does not read ${m.table}. Join path: ${joinPath(catalog,[...sourceTables.map(t=>t.name),m.table])}. GROUP BY ${m.table}.${m.column}.`);
+   }
+  }
   if(projected.some(e=>e.class==='FUNCTION'&&AGGREGATES.includes(e.function_name?.toLowerCase()))&&!projected.some(e=>e.class==='STAR')&&root.type==='SELECT_NODE'&&!root.from_table?.subquery)
    for(const t of sourceTables)for(const column of t.columns){
     if(column.values.length<2)continue;

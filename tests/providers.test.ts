@@ -36,3 +36,13 @@ test('credential errors are reported as unavailable, not retried as bad output',
  globalThis.fetch=async()=>new Response('denied',{status:401});
  await assert.rejects(new OpenAICompatibleProvider('http://h/v1','bad',{},'auto','none').complete(req),/credentials/);
 });
+test('rate limits and gateway errors are retried with backoff, honouring Retry-After',async()=>{
+ let calls=0;
+ globalThis.fetch=async()=>{calls++;if(calls===1)return new Response('busy',{status:429,headers:{'Retry-After':'0'}});if(calls===2)return new Response('bad gateway',{status:502});return new Response(JSON.stringify({choices:[{message:{content:'{"sql":"SELECT 9"}'}}]}));};
+ const c=await new OpenAICompatibleProvider('http://h/v1','',{},'auto','none').complete({...req,timeoutMs:20000});
+ assert.equal(c.content,'{"sql":"SELECT 9"}');assert.equal(calls,3);
+});
+test('client errors are not retried',async()=>{
+ let calls=0;globalThis.fetch=async()=>{calls++;return new Response('{"error":"bad request: context too long"}',{status:400});};
+ await assert.rejects(new OpenAICompatibleProvider('http://h/v1','',{},'prompt','none').complete({...req,jsonSchema:undefined}),/HTTP 400/);assert.equal(calls,1);
+});

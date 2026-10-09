@@ -27,6 +27,9 @@ export function numericConditions(g:Grounding,catalog:Catalog):NumericCondition[
   const pre=text.match(new RegExp(`(?:\\b(${OP_WORDS})\\s+)?(\\d+(?:\\.\\d+)?)\\s*(?:${UNITS})?\\s+(?:of\\s+)?(?:\\w+\\s+)?${col}\\b`));
   // "<column> [is] <op> <n>"  e.g. "cvss score above 9", "downtime over 120 minutes"
   const post=text.match(new RegExp(`\\b${col}\\s+(?:is\\s+|are\\s+|of\\s+)?(?:(${OP_WORDS})\\s+)?(\\d+(?:\\.\\d+)?)\\b`));
+  // "negative downtime", "zero cost", "positive cvss": sign words are thresholds too.
+  const sign=text.match(new RegExp(`\\b(negative|zero|positive|non zero|nonzero)\\s+(?:\\w+\\s+)?${col}\\b`));
+  if(!pre&&!post&&sign){seen.add(key);out.push({table:m.table,column:m.column!,op:sign[1]==='negative'?'<':sign[1]==='zero'?'=':'>',value:0,text:sign[0]});continue;}
   const hit=pre||post;if(!hit)continue;
   // "in the last 7 days" is a time window, not a value of a *_days column.
   const before=text.slice(0,text.indexOf(hit[0])).trim().split(' ').at(-1)||'';

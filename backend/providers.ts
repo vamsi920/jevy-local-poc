@@ -21,11 +21,32 @@ export interface Provider{
  online():Promise<boolean>;
 }
 
+// Enterprise endpoints are shared and sometimes busy: rate limits (429), gateway hiccups (502/503/504)
+// and dropped connections are retried with exponential backoff and jitter, honouring Retry-After, but
+// never beyond this call's time budget. Client errors (400/401/404) are returned immediately.
+const RETRYABLE=new Set([408,425,429,500,502,503,504]);
+export const retryStats={retries:0};
 async function request(url:string,init:RequestInit,timeoutMs:number,label:string){
- try{return await fetch(url,{...init,signal:AbortSignal.timeout(Math.max(1,timeoutMs))});}
- catch(e){
-  if(e instanceof Error&&(e.name==='TimeoutError'||/timeout|aborted/i.test(e.message)))throw new Error(`Model call took longer than ${Math.round(timeoutMs/1000)}s; this model may be too slow for the request budget.`);
-  throw new UnavailableError(`${label} unavailable (${e instanceof Error?e.message:String(e)}).`);
+ const deadline=Date.now()+Math.max(1,timeoutMs);let attempt=0;let lastError='';
+ for(;;){
+  const remaining=deadline-Date.now();
+  if(remaining<=0)throw new Error(`Model call took longer than ${Math.round(timeoutMs/1000)}s${lastError?` (last error: ${lastError})`:''}; the endpoint may be overloaded or too slow for the request budget.`);
+  let r:Response|undefined;
+  try{r=await fetch(url,{...init,signal:AbortSignal.timeout(remaining)});}
+  catch(e){
+   const message=e instanceof Error?e.message:String(e);
+   if(e instanceof Error&&(e.name==='TimeoutError'||/timeout|aborted/i.test(message)))throw new Error(`Model call took longer than ${Math.round(timeoutMs/1000)}s; the endpoint may be overloaded or too slow for the request budget.`);
+   // Connection refused on the first try means the endpoint is down; resets mid-way are retried.
+   if(attempt===0&&/ECONNREFUSED|ENOTFOUND|EAI_AGAIN/i.test(message+String((e as {cause?:unknown}).cause||'')))throw new UnavailableError(`${label} unavailable (${message}).`);
+   lastError=message;
+  }
+  if(r&&!RETRYABLE.has(r.status))return r;
+  if(r)lastError=`HTTP ${r.status}`;
+  if(++attempt>config.llm.retries){if(r)return r;throw new UnavailableError(`${label} unavailable after ${attempt} attempts (${lastError}).`);}
+  const retryAfter=Number(r?.headers.get('retry-after'));
+  const wait=Math.min(Number.isFinite(retryAfter)&&retryAfter>0?retryAfter*1000:500*2**(attempt-1)*(0.75+Math.random()*0.5),Math.max(0,deadline-Date.now()-250),20000);
+  retryStats.retries++;
+  await new Promise(res=>setTimeout(res,wait));
  }
 }
 let callSeq=0;const callId=()=>'call_'+(++callSeq).toString(36);

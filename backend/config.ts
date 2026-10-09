@@ -37,6 +37,8 @@ export const config = {
   capabilities:(process.env.LLM_CAPABILITIES||'').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean),
   // Upper bound on parallel model calls (candidates, sub-questions); match the endpoint's capacity.
   concurrency:Math.max(1,Number(process.env.LLM_CONCURRENCY||4)),
+  // Retries for rate limits / transient gateway errors (with backoff, within each call's budget).
+  retries:Math.max(0,Number(process.env.LLM_RETRIES||4)),
  },
  port: Number(process.env.BACKEND_PORT || 3001),
  dbPath: resolve(process.env.DB_PATH || './data/jevy.duckdb'),
@@ -46,9 +48,17 @@ export const config = {
  seed: Number(process.env.SEED || 42),
  asOf: process.env.DATA_AS_OF || '2026-10-07',
  maxRows: Number(process.env.MAX_ROWS || 200),
- sqlTimeout: Number(process.env.SQL_TIMEOUT_MS || 10000),
+ sqlTimeout: Number(process.env.SQL_TIMEOUT_MS || 30000),
+ // Background schema profiling may scan big tables; it gets its own, longer timeout.
+ profileTimeout: Number(process.env.PROFILE_TIMEOUT_MS || 300000),
+ // Tables above this size are profiled from samples (values marked incomplete) instead of full scans.
+ sampleAboveRows: Number(process.env.PROFILE_SAMPLE_ABOVE_ROWS || 50000000),
+ // DuckDB resources for analytical queries on large data; spills to a temp directory instead of failing.
+ dbMemoryLimit: process.env.DB_MEMORY_LIMIT || '2GB',
+ dbThreads: Number(process.env.DB_THREADS || 4),
  // Hard ceiling for one question. The model profile picks a smaller adaptive budget below this.
- requestTimeout: Math.min(180000, Number(process.env.REQUEST_TIMEOUT_MS || 180000)),
+ // Remote endpoints are slower; the profile scales the budget with measured latency up to this ceiling.
+ requestTimeout: Math.min(600000, Number(process.env.REQUEST_TIMEOUT_MS || 300000)),
  llmTimeout: Number(process.env.LLM_TIMEOUT_MS || 90000),
  agentTier: tier as 'tiny'|'small'|'large'|undefined,
 };

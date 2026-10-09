@@ -52,6 +52,21 @@ GATEWAY_KEY=test npx tsx scripts/openai-gateway.ts
 LLM_PROVIDER=openai LLM_BASE_URL=http://127.0.0.1:8787/v1 LLM_API_KEY=test LLM_MODEL=qwen3:0.6b LLM_PARAMS_B=0.6 LLM_CAPABILITIES=tools npm run dev
 ```
 
+### Enterprise scale: slow APIs and large tables
+
+- **Remote endpoints:**
+  - Calls that fail with 429/5xx or dropped connections retry with exponential backoff and honour `Retry-After` (`LLM_RETRIES`), always within that call's budget.
+  - The per-question budget grows with the endpoint's measured call latency, up to `REQUEST_TIMEOUT_MS` (default 5 min, max 10 min).
+  - `LLM_CONCURRENCY` caps parallel calls.
+  - Progress streams to the UI throughout.
+- **Large tables:** answers are always computed in SQL; the model never reads raw tables.
+  - Results larger than `MAX_ROWS` report the exact total and a DuckDB-computed summary over all rows (ranges, sums, averages, top categories). Only that summary goes to the model.
+  - Profiling uses exact distinct counts for keys and approximate ones elsewhere. Join checks are sampled. Tables above `PROFILE_SAMPLE_ABOVE_ROWS` are profiled from a sample, and the guard then treats their value lists as incomplete.
+  - DuckDB memory, threads and spill-to-disk are configurable (`DB_MEMORY_LIMIT`, `DB_THREADS`).
+- **Sub-agents:** compound questions run as parallel, individually verified sub-queries and are merged into one answer. These include enumerations ("counts of A, B and C"), comparisons ("production versus test") and planner-decomposed questions. Planner sub-questions are validated: they must ground in the schema, use only filters the user mentioned, and add no unrequested groupings.
+
+Test data at scale: `SCALE=250 DB_PATH=./data/jevy-large.duckdb npm run db:generate` builds 14.5M rows in about 30 s. `scripts/openai-gateway.ts` can simulate a slow, flaky endpoint (`GATEWAY_DELAY_MS`, `GATEWAY_FAIL_RATE`).
+
 ### Schema understanding
 
 On startup, once a day while the app runs (`SCHEMA_REFRESH_MS`, default 24 h), and within minutes of the database file changing (`SCHEMA_CHANGE_CHECK_MS`, a cheap file check), the catalog profiles every table: row grain, primary keys, verified joins with cardinality ("each server has about 6 vulnerabilities, 7 have none"), value lists, ranges and null rates. The configured model then writes notes in the background to `data/schema-notes.json`: table purpose, example questions and business synonyms.
@@ -108,8 +123,28 @@ Strategy also adapts to **measured speed**: each model's real tokens/second on t
 
 - **Conversation history** in a left pane: start a new conversation, search, rename, delete, and reopen any past conversation. History is stored in its own writable DuckDB file (`data/chat-history.duckdb`, `CHAT_DB_PATH`), separate from the read-only analytics database. Each conversation also stores the agent's follow-up memory, so follow-ups keep working after a restart. The pane collapses to an icon rail (desktop) or becomes a drawer (phone).
 - **Model switcher** in the header lists installed Ollama models with their tier (fast / balanced / most capable), strategy (self-consistency or agent loop), reasoning support and measured speed. Choosing a model loads it in the background (`POST /api/models/warm`) so the first question isn't slowed by loading.
-- **Live thinking view**: a five-phase timeline (understand → explore → query → verify → answer) with the current phase, elapsed time and the latest steps in plain language, streamed from the backend. When the answer arrives it collapses into a "Thought for N s" pill that expands into the full grouped timeline.
-- **Answers** reveal word by word, followed by result cards (metrics or tables) with Show SQL / Copy. Copy and Retry are on every answer. Blue theme with light and dark modes, keyboard focus states and reduced-motion support.
+- **Live thinking trace** (vertical, like Codex/Cursor): each phase (understand → find data → query → check → answer) is a step with a spinner while active and a check when done, its duration, and every real backend event under it — tables found, SQL being run (as code chips), repairs, review results, and each model call as it starts ("Model · drafting a query"). When the answer arrives the trace folds into "Thought for N s · steps · model calls" and can be reopened.
+- **Answers** reveal word by word, followed by a chart card (when there is one) and result cards (metrics or tables) with Show SQL / Copy. Copy and Retry are on every answer. White theme, keyboard focus states, reduced-motion support, phone layout.
+
+## Charts
+
+Ask for a chart in any wording — "pie chart of servers by os", "plot incidents per month", "stacked bar chart of vulnerabilities by severity and status", "histogram of cpu cores", "servers by region as a donut chart" — or turn the previous answer into one ("make that a pie chart", "chart it", "now as a horizontal bar chart"). Breakdowns and trends also get a chart automatically; single numbers stay as figures.
+
+How it works (`backend/chart.ts`, rendered with Recharts in `frontend/src/Chart.tsx`):
+- Chart wording is removed before the data pipeline runs, so the question is answered exactly as it would be without the chart (same grounding, SQL guard and verification).
+- The **chart contract** (`ChartSpec`, zod-validated): type (`kpi | bar | column | line | area | stacked | grouped | pie | donut | scatter`), title, x field and kind, series, y format, data, notes, and the evidence step it came from. Every plotted value is copied from executed query rows; the model never produces chart numbers.
+- The form follows **what the question is trying to show** and the result's shape:
+  - **Share or proportion** → donut (≤7 parts) or treemap. **Ranking** ("top", "most") → sorted horizontal bars with value labels. **Compare** → grouped bars.
+  - **Trend** → area, or one line per category. **Share over time** → stacked area. **Cumulative** → running-total line. Only 2–3 periods → columns.
+  - **Two dimensions** → stacked bars, 100% stacked for shares, or a heatmap when both sides have many values.
+  - **Three or more comparable measures** → radar. **A single percentage** → gauge. **Many categories** → treemap.
+  - A small breakdown of a whole → donut. Ordered categories (Critical → Low, P1 → P4) → columns.
+  - Averages, maxima and scores never become a pie, treemap or stack, because they don't add up to a total.
+- Every chart has a **View as** row listing the other forms that are valid for the same data (e.g. Donut · Columns · Bars · Treemap · Radial). Switching only reorders the data or folds small slices; it never computes new numbers.
+- **Summaries become dashboards**: "give me a summary of servers" returns one chart per breakdown, using different forms (donut, columns, bars, treemap, radial) rather than one kind repeated.
+- If you name a type, it is used when the data supports it; otherwise the chart says why it fell back (for example, a pie of averages becomes columns with a note).
+- Accuracy safeguards: more than 30 categories are capped with a note; pies keep 7 slices and fold the rest into "Other"; ordered categories keep their natural order (Critical → Low, P1 → P4); an incomplete latest period (data ends mid-month) is called out; a chart is never shown for a question the data cannot answer.
+- Each chart card has Chart / Table / SQL views, hover tooltips (stack totals included), and CSV download. Colours are a fixed categorical order validated for colour-vision deficiency on white.
 
 API: `GET /api/models`, `POST /api/models/warm`, `GET /api/suggestions`, `GET|PATCH|DELETE /api/conversations[/:id]`, `POST /api/chat` (NDJSON: `start`, `progress` with `phase`, `result`).
 
@@ -136,6 +171,7 @@ npm test           # real DuckDB safety + orchestration tests; uses injected mod
 npm run build      # TypeScript checks and production frontend build
 npm run evaluate   # 54 live Ollama questions; model must be installed and served
 BATTERY_SET=100 npm run battery   # 104-question set across every table, joins, dates, follow-ups, guardrails
+npx tsx tests/chart-battery.ts   # 88 chart requests checked against independent oracle SQL
 npm run battery    # 58-case core battery (30 dev + 15 held-out): typos, synonyms, 2-4 table joins, follow-ups, dates, writes
 ./scripts/run-batteries.sh qwen3:0.6b@all qwen3:4b@dev   # one model at a time
 npm run report     # create EVALUATION.md from measured results
@@ -192,12 +228,13 @@ The transferable changes are bounded reasoning, catalog grounding, dependency ex
 
 | Test set | Result | Mean latency |
 |---|---|---|
-| 150-question stress set (`BATTERY_SET=150`): slang and typos, estate → application → server → incident/vulnerability/backup/upgrade chains, incident ↔ vulnerability via servers, latest-per-entity, NULL and negation, numeric thresholds, dates, lookups, 2–3 turn follow-ups, multi-questions, guardrails | **148/148** | 3.0 s |
-| 100-question set (`BATTERY_SET=100`) | **104/104** | 2.6 s |
-| Core set (58 cases, incl. held-out and fresh) | **58/58** | 5.7 s |
+| Chart battery (`tests/chart-battery.ts`, 88 requests, 15 different chart forms produced, incl. intent-driven variety and 4 summary dashboards): explicit types, typos, joins, time series and trends split by category, two-field breakdowns, histograms, chart-only follow-ups, auto charts, figures, unanswerable requests — every plotted value checked against independent SQL | **88/88** | 0.9 s |
+| 150-question stress set (`BATTERY_SET=150`): slang and typos, estate → application → server → incident/vulnerability/backup/upgrade chains, incident ↔ vulnerability via servers, latest-per-entity, NULL and negation, numeric thresholds, dates, lookups, 2–3 turn follow-ups, multi-questions, guardrails | **148/148** | 3.4 s |
+| 100-question set (`BATTERY_SET=100`) | **104/104** | 4.4 s |
+| Core set (58 cases, incl. held-out and fresh) | **58/58** | 2.6 s |
 | Enterprise path: OpenAI-compatible API via `scripts/openai-gateway.ts` (30 mixed questions, no reasoning mode) | **30/30** | 0.9 s |
-| Grounded-draft precision, run through the full SQL guard (deterministic, no model) | **191/191** correct when it fires | — |
-| Unit tests (`npm test`) | **114/114** | — |
+| Grounded-draft precision, run through the full SQL guard (deterministic, no model) | **219/219** correct when it fires | — |
+| Unit tests (`npm test`) | **127/127** | — |
 
 How it got there:
 - The 100-question set went 78 → 103 → 104/104.
@@ -209,4 +246,4 @@ Limits:
 - Bigger local models (4B and up) were not evaluated on this 8 GB Mac.
 - Always review the SQL behind answers used for important decisions.
 
-Raw results: `test-results/final3/` and `test-results/final2/gateway30-v2.json`.
+Raw results: `test-results/v7/` (latest), `test-results/v3/` (large database and slow/flaky gateway runs).

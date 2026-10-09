@@ -61,7 +61,7 @@ Never write data. Never answer from memory; every fact must come from query resu
      emit(`Running ${qid}: ${String(args.purpose||'query').slice(0,90)}`);
      const outcome=await runSQL(catalog,String(args.sql||''),sqlCtx);queries.set(qid,{outcome,purpose:String(args.purpose||'query')});
      if(!outcome.ok){emit(`${qid} failed: ${outcome.error.slice(0,100)}`);return {query_id:qid,error:outcome.error,hint:outcome.hint||undefined};}
-     return {query_id:qid,columns:Object.keys(outcome.rows[0]||{}),rows:outcome.rows.slice(0,profile.rowsForModel),row_count:outcome.rowCount,truncated:outcome.truncated||outcome.rows.length>profile.rowsForModel,warnings:outcome.warnings.length?outcome.warnings:undefined};
+     return {query_id:qid,columns:Object.keys(outcome.rows[0]||{}),rows:outcome.rows.slice(0,profile.rowsForModel),row_count:outcome.rowCount,truncated:outcome.truncated||outcome.rows.length>profile.rowsForModel,total_rows:outcome.totalRows,summary_of_all_rows:outcome.summary,warnings:outcome.warnings.length?outcome.warnings:undefined};
     }
     return {error:'Unknown tool '+call.function.name};
    }catch(e){return {error:e instanceof Error?e.message:String(e)};}

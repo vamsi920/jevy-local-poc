@@ -3,7 +3,7 @@ import {config} from './config.js';
 import { writeFile,readFile } from 'node:fs/promises';
 import { Database,identifier } from './db.js';
 import {groundSync,definitionsFor,type Grounding} from './grounding.js';
-export type Column={name:string;type:string;values:unknown[];lookup:unknown[];representatives:unknown[];description?:string;profile?:{nullCount:number;distinctCount:number;min?:unknown;max?:unknown}};
+export type Column={name:string;type:string;values:unknown[];lookup:unknown[];representatives:unknown[];description?:string;sampled?:boolean;profile?:{nullCount:number;distinctCount:number;min?:unknown;max?:unknown}};
 export type Table={name:string;description:string;rowCount:number;columns:Column[];primaryKey?:string;relationships:string[];notes?:string[]};
 // Notes the app writes about the data itself (see schema-notes.ts), keyed by schema fingerprint.
 export type LearnedNotes={fingerprint:string;model:string;learnedAt?:string;tables:Record<string,{summary?:string;examples?:string[]}>;tableSynonyms:Record<string,string[]>;valueSynonyms:Record<string,string>};
@@ -25,18 +25,22 @@ export class Catalog {
    const name=String(r.table_name);
    const cols=(await this.db.query(`SELECT column_name,data_type,comment FROM duckdb_columns() WHERE table_name='${name.replaceAll("'","''")}' AND schema_name='main' ORDER BY column_index`,500)).rows.filter(c=>/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(String(c.column_name)));
    const samples=(await this.db.query(`SELECT * FROM ${identifier(name)} LIMIT 3`,3)).rows;
-   // One pass for profile statistics of every column.
-   const expressions=cols.flatMap((c,i)=>{const q=identifier(String(c.column_name));const type=String(c.data_type);return [`count(*)-count(${q}) AS n${i}`,`count(DISTINCT ${q}) AS d${i}`,...(/INT|FLOAT|DOUBLE|DECIMAL|DATE|TIMESTAMP|NUMERIC|REAL/.test(type)&&!type.includes('[]')?[`min(${q}) AS lo${i}`,`max(${q}) AS hi${i}`]:[])];});
-   const stats=(await this.db.query(`SELECT count(*) AS __n${expressions.length?','+expressions.join(','):''} FROM ${identifier(name)}`,1)).rows[0]||{};
+   // Profiling scales to big tables: exact distinct counts only for id columns (primary-key detection),
+   // approximate elsewhere; beyond PROFILE_SAMPLE_ABOVE_ROWS value lists come from a sample.
+   const total=Number((await this.db.query(`SELECT count(*) n FROM ${identifier(name)}`,1,{timeoutMs:config.profileTimeout})).rows[0].n);
+   const big=total>1000000,huge=total>config.sampleAboveRows;
+   const source=huge?`(SELECT * FROM ${identifier(name)} USING SAMPLE 2000000 ROWS)`:identifier(name);
+   const expressions=cols.flatMap((c,i)=>{const q=identifier(String(c.column_name));const type=String(c.data_type);return [`count(*)-count(${q}) AS n${i}`,big&&!/(^|_)id$/.test(String(c.column_name))?`approx_count_distinct(${q}) AS d${i}`:`count(DISTINCT ${q}) AS d${i}`,...(/INT|FLOAT|DOUBLE|DECIMAL|DATE|TIMESTAMP|NUMERIC|REAL/.test(type)&&!type.includes('[]')?[`min(${q}) AS lo${i}`,`max(${q}) AS hi${i}`]:[])];});
+   const stats=(await this.db.query(`SELECT count(*) AS __n${expressions.length?','+expressions.join(','):''} FROM ${identifier(name)}`,1,{timeoutMs:config.profileTimeout})).rows[0]||{};
    const columns:Column[]=[];
    for(const [i,col] of cols.entries()){
     const cn=String(col.column_name),type=String(col.data_type);let values:unknown[]=[],lookup:unknown[]=[];
     const distinctCount=Number(stats['d'+i]||0);
     if(type==='VARCHAR'&&distinctCount<=LOOKUP_VALUES){
-     const all=(await this.db.query(`SELECT ${identifier(cn)} AS "value" FROM ${identifier(name)} WHERE ${identifier(cn)} IS NOT NULL GROUP BY 1 ORDER BY count(*) DESC, 1 LIMIT ${LOOKUP_VALUES}`,LOOKUP_VALUES)).rows.map(x=>x.value);
+     const all=(await this.db.query(`SELECT ${identifier(cn)} AS "value" FROM ${source} WHERE ${identifier(cn)} IS NOT NULL GROUP BY 1 ORDER BY count(*) DESC, 1 LIMIT ${LOOKUP_VALUES}`,LOOKUP_VALUES,{timeoutMs:config.profileTimeout})).rows.map(x=>x.value);
      if(all.length<=PROMPT_VALUES)values=[...all].sort((a,b)=>String(a).localeCompare(String(b)));else lookup=all;
     }
-    columns.push({name:cn,type,values,lookup,representatives:[...new Set(samples.map(r=>r[cn]))],description:col.comment?String(col.comment):undefined,profile:{nullCount:Number(stats['n'+i]||0),distinctCount,...Object.hasOwn(stats,'lo'+i)?{min:stats['lo'+i],max:stats['hi'+i]}:{}}});
+    columns.push({name:cn,type,values,lookup,sampled:huge||undefined,representatives:[...new Set(samples.map(r=>r[cn]))],description:col.comment?String(col.comment):undefined,profile:{nullCount:Number(stats['n'+i]||0),distinctCount,...Object.hasOwn(stats,'lo'+i)?{min:stats['lo'+i],max:stats['hi'+i]}:{}}});
    }
    const rowCount=Number(stats.__n||0);
    // Primary key: first *_id / id column whose values are unique and non-null.
@@ -46,7 +50,9 @@ export class Catalog {
   // Infer FK-like joins from same-named unique keys, then verify no orphan values.
   for(const t of tables)for(const c of t.columns)for(const target of tables){
    if(target===t||target.primaryKey!==c.name)continue;
-   const check=await this.db.query(`SELECT count(*) n FROM ${identifier(t.name)} a LEFT JOIN ${identifier(target.name)} b USING (${identifier(c.name)}) WHERE b.${identifier(c.name)} IS NULL AND a.${identifier(c.name)} IS NOT NULL`);
+   // Orphan check on a sample for big child tables: verifies the key without a full join.
+   const childSource=t.rowCount>1000000?`(SELECT ${identifier(c.name)} FROM ${identifier(t.name)} USING SAMPLE 200000 ROWS)`:identifier(t.name);
+   const check=await this.db.query(`SELECT count(*) n FROM ${childSource} a LEFT JOIN ${identifier(target.name)} b USING (${identifier(c.name)}) WHERE b.${identifier(c.name)} IS NULL AND a.${identifier(c.name)} IS NOT NULL`,1,{timeoutMs:config.profileTimeout});
    if(Number(check.rows[0].n)===0)t.relationships.push(`${t.name}.${c.name} = ${target.name}.${c.name}`);
   }
   // Relationship cardinality notes: how many child rows each parent row has, and how many have none.
@@ -54,8 +60,8 @@ export class Catalog {
    const [[,key],[parentName]]=r.split(' = ').map(x=>x.split('.'));const parent=tables.find(t=>t.name===parentName);if(!parent||!parent.rowCount)continue;
    const avg=child.rowCount/parent.rowCount;
    if(avg<=1.0001&&child.columns.find(c=>c.name===key)?.profile?.distinctCount===child.rowCount){(child.notes||=[]).push(`one row per ${parentName} row (1:1 via ${key})`);continue;}
-   const none=Number((await this.db.query(`SELECT count(*) n FROM ${identifier(parentName)} p WHERE NOT EXISTS (SELECT 1 FROM ${identifier(child.name)} c WHERE c.${identifier(key)} = p.${identifier(key)})`)).rows[0].n);
-   (parent.notes||=[]).push(`has many ${child.name} rows (avg ${avg.toFixed(1)} per ${parentName} row; ${none} ${parentName} rows have none) - counting ${parentName} across this join needs count(DISTINCT ${parentName}.${key})`);
+   const none=Number((await this.db.query(`SELECT count(*) n FROM ${identifier(parentName)} p WHERE NOT EXISTS (SELECT 1 FROM ${identifier(child.name)} c WHERE c.${identifier(key)} = p.${identifier(key)})`,1,{timeoutMs:config.profileTimeout}).catch(()=>({rows:[{n:-1}]}))).rows[0].n);
+   (parent.notes||=[]).push(`has many ${child.name} rows (avg ${avg.toFixed(1)} per ${parentName} row${none>=0?`; ${none} ${parentName} rows have none`:''}) - counting ${parentName} across this join needs count(DISTINCT ${parentName}.${key})`);
    (child.notes||=[]).push(`many rows per ${parentName} row (joined by ${key})`);
   }
   try{this.aliases=JSON.parse(await readFile('data/aliases.json','utf8'));}catch{}
@@ -76,7 +82,7 @@ export class Catalog {
   const referenceDate=await this.detectReferenceDate(tables,semantic);
   const fingerprint=createHash('sha256').update(JSON.stringify(tables)).digest('hex');
   if(this.cachePath)await writeFile(this.cachePath,JSON.stringify({tables,referenceDate},null,2));
-  this.tables=tables;this.semantic=semantic;this.referenceDate=referenceDate;if(fingerprint!==this.fingerprint)this.version++;this.fingerprint=fingerprint;this.refreshedAt=Date.now();this.sourceRevision=this.db.revision;this.refreshError='';return this;
+  this.tables=tables;this.categoryCache=undefined;this.semantic=semantic;this.referenceDate=referenceDate;if(fingerprint!==this.fingerprint)this.version++;this.fingerprint=fingerprint;this.refreshedAt=Date.now();this.sourceRevision=this.db.revision;this.refreshError='';return this;
  }
  // Snapshot databases often carry an "as of" date. Relative dates must use it, not the host clock.
  private async detectReferenceDate(tables:Table[],semantic:Semantic){
@@ -128,6 +134,9 @@ export class Catalog {
   const r=this.retrieve(query);
   return {tables:r.tables.map(t=>({table:t.name,description:t.description,columns:t.columns.map(c=>c.name+':'+c.type).join(', '),ddl:`CREATE TABLE ${identifier(t.name)} (${t.columns.map(c=>identifier(c.name)+' '+c.type).join(', ')});`,values:Object.fromEntries(t.columns.filter(c=>c.values.length&&r.grounding.mentions.some(m=>m.table===t.name&&m.column===c.name)).map(c=>[c.name,c.values])),joins:t.relationships.filter(link=>link.split(' = ').every(part=>r.tables.some(table=>table.name===part.split('.')[0])))})),definitions:definitionsFor(query,this),aliases:Object.fromEntries(Object.entries(this.aliases).filter(([k])=>query.toLowerCase().includes(k.toLowerCase())))};
  }
+ // Stored category values (small enumerations), used to catch answers that name a value the results never contained.
+ private categoryCache?:string[];
+ categoryValues(){return this.categoryCache??=[...new Set(this.tables.flatMap(t=>t.columns.filter(c=>c.type==='VARCHAR'&&c.values.length&&c.values.length<=50).flatMap(c=>c.values.map(String))))].filter(v=>!/^(true|false|yes|no)$/i.test(v));}
  table(name:string){const t=this.tables.find(x=>x.name===name)||this.tables.find(x=>x.name.toLowerCase()===String(name).toLowerCase());if(!t)throw new Error(`Unknown table ${name}. Known tables: ${this.tables.map(x=>x.name).join(', ')}`);return t;}
  async values(table:string,column:string){const t=this.table(table);if(!t.columns.some(c=>c.name===column))throw new Error(`Unknown column ${column} in ${t.name}. Columns: ${t.columns.map(c=>c.name).join(', ')}`);return this.db.query(`SELECT ${identifier(column)} AS "value",count(*) frequency FROM ${identifier(t.name)} GROUP BY 1 ORDER BY 2 DESC,1 LIMIT 30`,30);}
  async checkValues(sql:string){

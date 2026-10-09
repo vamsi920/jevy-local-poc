@@ -7,7 +7,7 @@ import type {Catalog} from './catalog.js';
 import type {Evidence,Row} from './types.js';
 
 export type SqlContext={question:string;grounding:Grounding;allowedLiterals:string[];followup:boolean;strict?:boolean};
-export type SqlOutcome={ok:true;sql:string;rows:Row[];rowCount:number;truncated:boolean;totalRows?:number;notes:string[];warnings:string[];durationMs:number}|{ok:false;sql:string;error:string;hint:string};
+export type SqlOutcome={ok:true;sql:string;rows:Row[];rowCount:number;truncated:boolean;totalRows?:number;summary?:ResultSummary;notes:string[];warnings:string[];durationMs:number}|{ok:false;sql:string;error:string;hint:string};
 
 export async function runSQL(catalog:Catalog,sql:string,ctx:SqlContext):Promise<SqlOutcome>{
  const start=performance.now();let current=sql.trim().replace(/;\s*$/,'');const notes:string[]=[];const warnings:string[]=[];
@@ -26,8 +26,12 @@ export async function runSQL(catalog:Catalog,sql:string,ctx:SqlContext):Promise<
    const sanity=checkResult(result.rows);if(sanity)warnings.push(sanity);
    // Large results: also count every matching row so answers state the true total, not "200+".
    let totalRows:number|undefined;
-   if(result.truncated){try{totalRows=Number(Object.values((await catalog.db.query(`SELECT count(*) AS n FROM (${normalized.sql.replace(/;\s*$/,'')}) jevy_total`,1)).rows[0])[0]);}catch{}}
-   return {ok:true,sql:normalized.sql,...result,totalRows,notes:[...new Set(notes)],warnings,durationMs:performance.now()-start};
+   let summary:ResultSummary|undefined;
+   if(result.truncated){
+    try{totalRows=Number(Object.values((await catalog.db.query(`SELECT count(*) AS n FROM (${normalized.sql.replace(/;\s*$/,'')}) jevy_total`,1)).rows[0])[0]);}catch{}
+    summary=await summarizeResult(catalog,normalized.sql,result.rows).catch(()=>undefined);
+   }
+   return {ok:true,sql:normalized.sql,...result,totalRows,summary,notes:[...new Set(notes)],warnings,durationMs:performance.now()-start};
   }catch(e){
    const error=e instanceof Error?e.message:String(e);
    const repair=await autoRepair(current,error,catalog);
@@ -44,7 +48,7 @@ function checkResult(rows:Row[]){
 }
 
 export function toEvidence(id:string,objective:string,o:SqlOutcome):Evidence{
- return o.ok?{stepId:id,objective,tool:'run_sql',sql:o.sql,rows:o.rows,rowCount:o.rowCount,truncated:o.truncated,totalRows:o.totalRows,durationMs:o.durationMs,repairs:0,warnings:o.warnings,queryPlan:{notes:o.notes}}
+ return o.ok?{stepId:id,objective,tool:'run_sql',sql:o.sql,rows:o.rows,rowCount:o.rowCount,truncated:o.truncated,totalRows:o.totalRows,summary:o.summary,durationMs:o.durationMs,repairs:0,warnings:o.warnings,queryPlan:{notes:o.notes}}
   :{stepId:id,objective,tool:'run_sql',sql:o.sql,rows:[],rowCount:0,truncated:false,durationMs:0,repairs:0,error:o.error+(o.hint?' Hint: '+o.hint:'')};
 }
 
@@ -83,4 +87,22 @@ export async function findValues(catalog:Catalog,text:string,table?:string,colum
 export function metadataRows(catalog:Catalog,tableNames?:string[]){
  if(tableNames?.length===1){const t=catalog.table(tableNames[0]);return t.columns.map(c=>({column:c.name,type:c.type,example:c.values.length?c.values.slice(0,6).join(', '):c.representatives[0]===undefined?null:String(c.representatives[0])}));}
  return catalog.tables.filter(t=>!catalog.isReferenceTable(t.name)).map(t=>({table:t.name,rows:t.rowCount,columns:t.columns.length,description:t.description||null}));
+}
+
+// Large results are never shipped to the model row by row: DuckDB computes column statistics over the
+// complete result (ranges, averages, distinct counts, top categories) and only that summary is shown.
+export type ResultSummary={column:string;min?:unknown;max?:unknown;avg?:number;sum?:number;distinct?:number;top?:{value:unknown;count:number}[]}[];
+export async function summarizeResult(catalog:Catalog,sql:string,sample:Row[]):Promise<ResultSummary>{
+ const cols=Object.keys(sample[0]||{}).filter(c=>/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(c)).slice(0,12);
+ const isNum=(c:string)=>sample.every(r=>r[c]===null||typeof r[c]==='number');
+ const base=`(${sql.replace(/;\s*$/,'')}) jevy_summary`;
+ const exprs=cols.flatMap(c=>{const q=identifier(c);return isNum(c)?[`min(${q}) AS "${c}__min"`,`max(${q}) AS "${c}__max"`,`avg(${q}) AS "${c}__avg"`,`sum(${q}) AS "${c}__sum"`]:[`approx_count_distinct(${q}) AS "${c}__distinct"`,`min(${q}) AS "${c}__min"`,`max(${q}) AS "${c}__max"`];});
+ const stats=(await catalog.db.query(`SELECT ${exprs.join(', ')} FROM ${base}`,1)).rows[0]||{};
+ const out:ResultSummary=cols.map(c=>({column:c,min:stats[c+'__min'],max:stats[c+'__max'],...(isNum(c)?{avg:Number(stats[c+'__avg']),sum:Number(stats[c+'__sum'])}:{distinct:Number(stats[c+'__distinct'])})}));
+ // Top categories for low-cardinality text columns.
+ for(const s of out.filter(x=>x.distinct!==undefined&&x.distinct>0&&x.distinct<=50).slice(0,3)){
+  const q=identifier(s.column);
+  s.top=(await catalog.db.query(`SELECT ${q} AS value, count(*) AS count FROM ${base} GROUP BY 1 ORDER BY 2 DESC LIMIT 5`,5)).rows.map(r=>({value:r.value,count:Number(r.count)}));
+ }
+ return out;
 }

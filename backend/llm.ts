@@ -45,6 +45,11 @@ function recordSpeed(model:string,c:Completion){
  const old=speeds.get(model);const a=old?0.4:1;
  speeds.set(model,{genTps:old?old.genTps*(1-a)+gen*a:gen,promptTps:prompt?(old?old.promptTps*(1-a)+prompt*a:prompt):(old?.promptTps||400),samples:(old?.samples||0)+1});
 }
+// Wall-clock latency per model call (network + queueing + generation), used to size request budgets
+// for slower remote endpoints.
+const latencies=new Map<string,number>();
+export function latencyOf(model:string){return latencies.get(model);}
+function recordLatency(model:string,ms:number){const old=latencies.get(model);latencies.set(model,old===undefined?ms:old*0.7+ms*0.3);}
 function remainingMs(trace:Trace){const remaining=(trace.deadlineMs||Date.now()+config.llmTimeout)-Date.now();if(remaining<=0)throw new BudgetError();return remaining;}
 
 // Bounded parallelism: candidates and sub-questions fan out, but never beyond what the endpoint can serve.
@@ -54,7 +59,8 @@ async function slot<T>(fn:()=>Promise<T>):Promise<T>{
  running++;try{return await fn();}finally{running--;waiting.shift()?.();}
 }
 async function complete(req:Parameters<ReturnType<typeof provider>['complete']>[0],trace:Trace){
- try{const c=await slot(()=>provider().complete({...req,timeoutMs:Math.min(config.llmTimeout,remainingMs(trace))}));recordSpeed(req.model,c);return c;}
+ const started=Date.now();
+ try{const c=await slot(()=>provider().complete({...req,timeoutMs:Math.min(config.llmTimeout,remainingMs(trace))}));recordSpeed(req.model,c);recordLatency(req.model,Date.now()-started);return c;}
  catch(e){if(trace.deadlineMs&&Date.now()>=trace.deadlineMs-50&&!(e instanceof UnavailableError))throw new BudgetError();throw e;}
 }
 
@@ -63,6 +69,7 @@ export const model:Model=async(schema,purpose,system,input,trace,options={})=>{
  const profile=await getProfile(modelName);
  const thinking=Boolean(options.think)&&profile.thinking;
  const responseSchema=z.toJSONSchema(schema) as Record<string,unknown>;
+ trace.notify?.(`Model call: ${purpose}`);
  let feedback='';let maxTokens=options.maxTokens||(thinking?profile.thinkTokens:900);
  for(let attempt=0;attempt<2;attempt++){
   remainingMs(trace);
@@ -95,6 +102,7 @@ export const chat:Chat=async(messages,tools,purpose,trace,options={})=>{
  const profile=await getProfile(modelName);
  const thinking=Boolean(options.think)&&profile.thinking;
  const start=performance.now();
+ trace.notify?.(`Model call: ${purpose}`);
  try{
   const c=await complete({model:modelName,messages,tools,think:thinking,temperature:options.temperature??0,seed:options.seed??config.seed,numCtx:profile.numCtx,maxTokens:options.maxTokens||(thinking?profile.thinkTokens+1024:1536),timeoutMs:0},trace);
   trace.llm.push({purpose,durationMs:performance.now()-start,thinking,tokens:c.genTokens,promptTokens:c.promptTokens});

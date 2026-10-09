@@ -9,7 +9,9 @@ export function requestedLimit(question:string){const m=question.match(/\b(?:sho
 export function resolveContract(question:string,catalog:Catalog,scopeIds:string[]=[]):Contract|null{
  const query=question.replace(/operating systems?/ig,'os');const tables=catalog.retrieve(query).tables;
  const numericRequest=tables.some(t=>t.columns.some(c=>/INT|FLOAT|DOUBLE|DECIMAL/.test(c.type)&&words(query).includes(c.name.split('_')[0])));
- if(!numericRequest&&!/\b(average|avg|sum|minimum|maximum|min|max|percent|percentage|share|ratio|how many different)\b/i.test(query)&&/\b(summary|summariz\w*|overview|different|diferent|distribution|breakdown|group|each|every|per|by)\b/i.test(query)&&!requestedLimit(query)){
+ // Time buckets ("per month", "weekly") are a trend, not a plain category profile.
+ const timeBucket=/\b(?:per|by|each|every|over) (?:the )?(?:day|week|month|quarter|year)s?\b|\b(daily|weekly|monthly|quarterly|yearly|annually|over time|trend)\b/i.test(query);
+ if(!timeBucket&&!numericRequest&&!/\b(average|avg|sum|minimum|maximum|min|max|percent|percentage|share|ratio|how many different)\b/i.test(query)&&/\b(summary|summariz\w*|overview|different|diferent|distribution|breakdown|group|each|every|per|by)\b/i.test(query)&&!requestedLimit(query)){
   const choices=tables.map(t=>({t,groups:t.columns.filter(c=>c.values.length>1&&mentions(query,c.name)).map(c=>c.name)})).filter(x=>x.groups.length);
   if(choices.length===1){const {t,groups}=choices[0];return {kind:'category_profile',baseTable:t.name,entityKey:t.primaryKey,groupBy:groups,columns:[],limit:200,random:false,scopeIds,question};}
  }

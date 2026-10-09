@@ -45,6 +45,9 @@ app.get('/api/suggestions',(_req,res)=>{
  if(child&&rel){const parent=rel.split(' = ')[1].split('.')[0];const label=catalog.tables.find(t=>t.name===parent)?.columns.find(c=>/(_name|hostname|title)$/.test(c.name));out.push(`Which 5 ${parent} have the most ${child.name}${label?`, with their ${label.name.replaceAll('_',' ')}`:''}?`);}
  const dated=tables.find(t=>t.columns.some(c=>/DATE|TIMESTAMP/.test(c.type)&&/created|start|discover/.test(c.name)));
  if(dated)out.push(`How many ${dated.name} were recorded last month?`);
+ // One chart example, so people discover that any breakdown or trend can be drawn.
+ if(dated)out.splice(1,0,`Plot ${dated.name} per month`);
+ else{const t=tables.find(x=>x.columns.some(c=>c.values.length>2&&c.values.length<=8));const c=t?.columns.find(c=>c.values.length>2&&c.values.length<=8);if(t&&c)out.splice(1,0,`Pie chart of ${t.name} by ${c.name.replaceAll('_',' ')}`);}
  res.json({suggestions:out.slice(0,4)});
 });
 app.get('/api/conversations',async(_req,res)=>res.json({conversations:await store.list()}));

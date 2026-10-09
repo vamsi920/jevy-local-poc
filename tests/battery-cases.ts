@@ -4,7 +4,9 @@
 export type BatteryCase={
  id:string;split:'dev'|'holdout'|'fresh';category:string;
  turns:string[];
- check:'scalar'|'rows'|'contains'|'write'|'unsupported'|'ambiguous';
+ check:'scalar'|'rows'|'contains'|'write'|'unsupported'|'ambiguous'|'shape';
+ // For check 'shape': the expected answer shape (driver), or 'nodump' (anything but a raw row dump).
+ shape?:'overview'|'record'|'creative'|'joke'|'query'|'nodump'|'conversation'|'multi';
  oracle?:string|string[];values?:(string|number)[];
 };
 export const battery:BatteryCase[]=[

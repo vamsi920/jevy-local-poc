@@ -112,7 +112,7 @@ export async function solveSQL(catalog:Catalog,llm:Model,profile:Profile,input:S
  const measures=(o:typeof good[number])=>wantsMeasure&&/\b(count|sum|avg|min|max|count_star)\s*\(/i.test(o.sql)?0:1;
  scored.sort((a,b)=>assumes(a.o)-assumes(b.o)||b.score-a.score||measures(a.o)-measures(b.o)||Number(!b.o.warnings.length)-Number(!a.o.warnings.length)||Number(b.o.rows.length>0)-Number(a.o.rows.length>0)||a.i-b.i);
  let chosen=scored[0].o;
- if(new Set(good.map(canonical)).size>1)emit(scored[0].score>1?`Queries disagreed — ${scored[0].score} of ${good.length} agree on the chosen result`:'Queries disagreed — kept the most reliable result');else if(good.length>1)emit(`All ${good.length} queries agree`);
+ if(new Set(good.map(canonical)).size>1)emit(scored[0].score>=good.length?`Queries were written differently but all ${good.length} return matching results`:scored[0].score>1?`Queries disagreed — ${scored[0].score} of ${good.length} agree on the chosen result`:'Queries disagreed — kept the most reliable result');else if(good.length>1)emit(`All ${good.length} queries agree`);
 
  // Larger models review the chosen query once against the question; concrete problems get one repair.
  if(profile.review&&(trace.deadlineMs||Infinity)-Date.now()>25000){

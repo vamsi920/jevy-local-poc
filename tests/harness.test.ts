@@ -9,6 +9,7 @@ import {runSQL} from '../backend/tools.js';
 import {verifyProse,templateAnswer} from '../backend/answer.js';
 import {isWriteRequest,splitQuestions} from '../backend/agent.js';
 import type {Evidence} from '../backend/types.js';
+import {answerShape,overview} from '../backend/shapes.js';
 let db:Database,catalog:Catalog;
 before(async()=>{db=await Database.open();catalog=await new Catalog(db).build();});after(()=>db.close());
 const ctx=(q:string)=>({question:q,grounding:groundSync(q,catalog),allowedLiterals:[],followup:false});
@@ -103,4 +104,33 @@ test('latest record per entity is ranked by the event date',async()=>{
  const d=draftSQL('How many servers had their most recent backup fail?',await ground('How many servers had their most recent backup fail?',catalog),catalog)!;
  assert.match(d.sql,/row_number\(\) OVER \(PARTITION BY "server_id" ORDER BY "started_at" DESC/);
  assert.equal(Object.values((await db.query(d.sql)).rows[0])[0],(await db.query("WITH r AS (SELECT *,row_number() OVER(PARTITION BY server_id ORDER BY started_at DESC,backup_id DESC) rn FROM backups) SELECT count(*) n FROM r WHERE rn=1 AND status='Failed'")).rows[0].n);
+});
+test('answers naming a stored value absent from the results are rejected',()=>{
+ const e=[{stepId:'a',objective:'o',sql:'',columns:['application_name'],rows:[{application_name:'HR Suite 78'}],rowCount:1,truncated:false,repairs:0}] as any;
+ const values=['Linux','Windows Server','Production'];
+ assert.ok(!verifyProse('host-00042 runs on Linux and is on HR Suite 78.',e,'What OS does host-00042 run and which application is it on?',values).ok);
+ assert.ok(verifyProse('host-00042 is on HR Suite 78.',e,'What OS does host-00042 run and which application is it on?',values).ok);
+});
+test('answer shape: summaries, deep dives and jokes are recognised; measured questions stay queries',async()=>{
+ const shape=async(q:string)=>answerShape(q,await ground(q,catalog),catalog).kind;
+ assert.equal(await shape('give me a summary of servers we have'),'overview');
+ assert.equal(await shape('summery of incidnets'),'overview');
+ assert.equal(await shape('bringup any vulnerability we have and gt me a history of it and entire details of it'),'record');
+ assert.equal(await shape('tell me everything about host-00042'),'record');
+ assert.equal(await shape('tell me a joke about the vulnerabilities we have'),'creative');
+ assert.equal(await shape('summarize incidents by priority'),'query');
+ assert.equal(await shape('how many vulnerabilities are there by severity?'),'query');
+ assert.equal(await shape('what is the os of host-00042'),'query');
+});
+test('"details" and "dive" are words, not typos of schema terms',()=>{
+ assert.deepEqual(correctTypos('entire details of it',catalog).corrections,[]);
+ assert.deepEqual(correctTypos('deep dive into host-00500',catalog).corrections,[]);
+ assert.deepEqual(correctTypos('how many servrs',catalog).corrections,[{from:'servrs',to:'servers'}]);
+});
+test('overview merges parallel aggregates that agree with the table',async()=>{
+ const g=await ground('summary of open critical vulnerabilities',catalog);
+ const o=await overview(catalog,'vulnerabilities',g,()=>{});
+ const n=Number((await db.query("SELECT count(*) AS n FROM vulnerabilities WHERE status='Open' AND severity='Critical'")).rows[0].n);
+ assert.ok(o.text.startsWith(`**${n.toLocaleString('en-US')} vulnerabilities**`));
+ assert.ok(!/severity\*\*: Critical/.test(o.text),'filtered columns are not shown as a 100% mix');
 });
