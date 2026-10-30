@@ -51,9 +51,9 @@ app.get('/api/suggestions',(_req,res)=>{
  res.json({suggestions:out.slice(0,4)});
 });
 app.get('/api/conversations',async(_req,res)=>res.json({conversations:await store.list()}));
-app.get('/api/conversations/:id',async(req,res)=>{const c=await store.get(req.params.id);if(!c)return res.status(404).json({error:'Conversation not found'});res.json({...c,state:undefined});});
-app.patch('/api/conversations/:id',async(req,res)=>{const title=String(req.body?.title||'').trim();if(!title)return res.status(400).json({error:'Title required'});await store.rename(req.params.id,title);res.json({ok:true});});
-app.delete('/api/conversations/:id',async(req,res)=>{if(agent.busy.has(req.params.id))return res.status(409).json({error:'Conversation is answering'});await store.remove(req.params.id);agent.sessions.delete(req.params.id);res.json({ok:true});});
+app.get('/api/conversations/:id',async(req,res)=>{if(!/^[\w-]{1,80}$/.test(req.params.id))return res.status(400).json({error:'Invalid session ID.'});const c=await store.get(req.params.id);if(!c)return res.status(404).json({error:'Conversation not found'});res.json({...c,state:undefined});});
+app.patch('/api/conversations/:id',async(req,res)=>{if(!/^[\w-]{1,80}$/.test(req.params.id))return res.status(400).json({error:'Invalid session ID.'});const title=String(req.body?.title||'').trim();if(!title)return res.status(400).json({error:'Title required'});await store.rename(req.params.id,title);res.json({ok:true});});
+app.delete('/api/conversations/:id',async(req,res)=>{if(!/^[\w-]{1,80}$/.test(req.params.id))return res.status(400).json({error:'Invalid session ID.'});if(agent.busy.has(req.params.id))return res.status(409).json({error:'Conversation is answering'});await store.remove(req.params.id);agent.sessions.delete(req.params.id);res.json({ok:true});});
 app.post('/api/chat',async(req,res)=>{
  const {question,model}=req.body||{};let {sessionId}=req.body||{};
  if(model!==undefined&&(typeof model!=='string'||!(await models()).some(m=>m.name===model)))return res.status(400).json({error:'Unknown or unavailable local model.'});
